@@ -4,14 +4,15 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"io"
 	"net/http"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/horizon/horizon/internal/agent"
 	"github.com/horizon/horizon/internal/run"
 	"github.com/horizon/horizon/internal/sandbox"
 	"github.com/horizon/horizon/internal/storage"
-	"github.com/google/uuid"
 )
 
 // Handler implements the HTTP API.
@@ -99,14 +100,14 @@ func (h *Handler) listAgents(w http.ResponseWriter, r *http.Request) {
 	agents := make([]*agent.AgentDefinition, len(rows))
 	for i, row := range rows {
 		agentDef := &agent.AgentDefinition{
-			ID:            row.ID,
-			Name:          row.Name,
-			Description:   row.Description,
-			Goal:          row.Goal,
-			Instructions:  row.Instructions,
-			CreatedAt:     row.CreatedAt,
-			UpdatedAt:     row.UpdatedAt,
-			Version:       row.Version,
+			ID:           row.ID,
+			Name:         row.Name,
+			Description:  row.Description,
+			Goal:         row.Goal,
+			Instructions: row.Instructions,
+			CreatedAt:    row.CreatedAt,
+			UpdatedAt:    row.UpdatedAt,
+			Version:      row.Version,
 		}
 		json.Unmarshal(row.RuntimeConfig, &agentDef.RuntimeConfig)
 		json.Unmarshal(row.ModelConfig, &agentDef.ModelConfig)
@@ -156,14 +157,14 @@ func (h *Handler) getAgent(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 	agentDef := &agent.AgentDefinition{
-		ID:            row.ID,
-		Name:          row.Name,
-		Description:   row.Description,
-		Goal:          row.Goal,
-		Instructions:  row.Instructions,
-		CreatedAt:     row.CreatedAt,
-		UpdatedAt:     row.UpdatedAt,
-		Version:       row.Version,
+		ID:           row.ID,
+		Name:         row.Name,
+		Description:  row.Description,
+		Goal:         row.Goal,
+		Instructions: row.Instructions,
+		CreatedAt:    row.CreatedAt,
+		UpdatedAt:    row.UpdatedAt,
+		Version:      row.Version,
 	}
 	json.Unmarshal(row.RuntimeConfig, &agentDef.RuntimeConfig)
 	json.Unmarshal(row.ModelConfig, &agentDef.ModelConfig)
@@ -458,10 +459,10 @@ func (h *Handler) executeRun(ctx context.Context, runRecord *storage.RunRow, age
 
 	// Build engine options
 	opts := sandbox.RunOptions{
-		WorkspaceDir: ".", // TODO: Use proper workspace from agent config
+		WorkspaceDir: ".",          // TODO: Use proper workspace from agent config
 		YAMLFile:     "agent.yaml", // TODO: Generate from agent definition
 		Prompt:       prompt,
-		OutputWriter: nil, // TODO: Capture output to file
+		OutputWriter: io.Discard, // discard output for now
 		Env:          env,
 	}
 
