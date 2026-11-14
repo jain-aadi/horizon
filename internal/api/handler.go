@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/google/uuid"
@@ -462,12 +463,10 @@ func (h *Handler) executeRun(ctx context.Context, runRecord *storage.RunRow, age
 		WorkspaceDir: ".",          // TODO: Use proper workspace from agent config
 		YAMLFile:     "agent.yaml", // TODO: Generate from agent definition
 		Prompt:       prompt,
-		OutputWriter: io.Discard, // discard output for now
+		OutputWriter: io.Discard,   // discard output for now
 		Env:          env,
+		APIKey:       os.Getenv("GOOGLE_API_KEY"),
 	}
-
-	// TODO: Get API key from secure storage
-	// opts.APIKey = ...
 
 	result, err := h.engine.RunAgent(ctx, opts)
 	if err != nil {

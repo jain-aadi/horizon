@@ -49,6 +49,16 @@ The server runs until interrupted (Ctrl+C). Graceful shutdown is handled.
 | `HORIZON_PORT` | `8080` | HTTP server port |
 | `HORIZON_SOCKET` | `$XDG_RUNTIME_DIR/podman/podman.sock` | Podman socket path |
 | `HORIZON_IMAGE` | `localhost/horizon-sandbox:latest` | Container image for agent execution |
+| `HORIZON_REQUEST_TIMEOUT` | `30s` | Podman API request timeout |
+| `HORIZON_CONTAINER_TIMEOUT` | `10m` | Maximum duration of one container execution |
+| `HORIZON_AGENT_TIMEOUT` | `10m` | Configured default agent timeout; not yet enforced by the run executor |
+
+Configuration precedence is: built-in defaults, optional `.env` entries, inherited
+process environment, then explicitly supplied `--db` and `--port` flags. The `.env`
+file supports one unquoted `KEY=VALUE` entry per line; blank lines, `#` comments,
+and malformed lines are ignored. Timeout values use Go duration syntax and must be
+greater than zero, for example `30s` or `10m`. Startup fails when `HORIZON_PORT` is
+not an integer from 1 through 65535 or a configured timeout is invalid.
 
 ### 4. Test with curl
 
@@ -88,7 +98,7 @@ curl "http://127.0.0.1:8080/api/runs?agent_id=<AGENT_ID>"
 | **Container management** | Auto-create, start, stream logs, wait for exit, auto-remove (deferred) |
 | **Health checks** | Podman socket reachability + image existence check |
 | **Cancel runs** | In-progress runs can be cancelled via `POST /api/runs/{id}?action=cancel` |
-| **Configuration** | `GOOGLE_API_KEY`, image name, socket path, port via env vars |
+| **Configuration** | `.env`, process environment, and explicit `--db` / `--port` overrides; database path, image, socket path, API timeout, and container timeout are applied |
 | **HTTP API** | RESTful endpoints: `/api/agents`, `/api/runs`, `/api/health` |
 
 ### ❌ Not Yet Covered (Phase 2+)

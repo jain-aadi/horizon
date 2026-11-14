@@ -1,6 +1,9 @@
 package config
 
 import (
+	"fmt"
+	"os"
+	"strconv"
 	"time"
 )
 
@@ -60,4 +63,56 @@ func DefaultConfig() *Config {
 			DefaultImage:   "localhost/horizon-sandbox:latest",
 		},
 	}
+}
+
+// LoadFromEnv loads configuration from environment variables.
+// Environment variables take precedence over defaults.
+func (c *Config) LoadFromEnv() error {
+	if v := os.Getenv("HORIZON_DB_PATH"); v != "" {
+		c.Database.Path = v
+	}
+	if v := os.Getenv("HORIZON_PORT"); v != "" {
+		port, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("parse HORIZON_PORT: %w", err)
+		}
+		if port < 1 || port > 65535 {
+			return fmt.Errorf("HORIZON_PORT must be between 1 and 65535")
+		}
+		c.Server.Port = port
+	}
+	if v := os.Getenv("HORIZON_SOCKET"); v != "" {
+		c.Podman.SocketPath = v
+	}
+	if v := os.Getenv("HORIZON_IMAGE"); v != "" {
+		c.Podman.ImageName = v
+		c.Agent.DefaultImage = v
+	}
+	if err := loadDurationFromEnv("HORIZON_REQUEST_TIMEOUT", &c.Podman.RequestTimeout); err != nil {
+		return err
+	}
+	if err := loadDurationFromEnv("HORIZON_CONTAINER_TIMEOUT", &c.Podman.ContainerTimeout); err != nil {
+		return err
+	}
+	if err := loadDurationFromEnv("HORIZON_AGENT_TIMEOUT", &c.Agent.DefaultTimeout); err != nil {
+		return err
+	}
+	return nil
+}
+
+func loadDurationFromEnv(name string, target *time.Duration) error {
+	v := os.Getenv(name)
+	if v == "" {
+		return nil
+	}
+
+	duration, err := time.ParseDuration(v)
+	if err != nil {
+		return fmt.Errorf("parse %s: %w", name, err)
+	}
+	if duration <= 0 {
+		return fmt.Errorf("%s must be greater than zero", name)
+	}
+	*target = duration
+	return nil
 }

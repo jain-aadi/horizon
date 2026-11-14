@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -17,21 +18,67 @@ import (
 	"github.com/horizon/horizon/internal/storage"
 )
 
+// loadEnvFile loads simple KEY=VALUE entries from a .env file without
+// overriding values inherited from the process environment.
+func loadEnvFile(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // .env file is optional
+		}
+		return err
+	}
+
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.TrimSpace(parts[0])
+		value := strings.TrimSpace(parts[1])
+		// The inherited process environment takes precedence, including an
+		// explicitly empty value.
+		if _, exists := os.LookupEnv(key); !exists {
+			os.Setenv(key, value)
+		}
+	}
+	return nil
+}
+
+func applyFlagOverrides(cfg *config.Config, flags *flag.FlagSet, dbPath string, port int) {
+	flags.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "db":
+			cfg.Database.Path = dbPath
+		case "port":
+			cfg.Server.Port = port
+		}
+	})
+}
+
 func main() {
 	var (
-		configPath = flag.String("config", "", "Path to config file (optional)")
 		dbPath     = flag.String("db", "./data/horizon.db", "Database path")
 		port       = flag.Int("port", 8080, "HTTP server port")
 		healthOnly = flag.Bool("health-check", false, "Run health check and exit")
 	)
 	flag.Parse()
 
-	cfg := config.DefaultConfig()
-	if *configPath != "" {
-		// TODO: Load config from file
+	// Load .env file
+	if err := loadEnvFile(".env"); err != nil {
+		log.Printf("Warning: failed to load .env: %v", err)
 	}
-	cfg.Database.Path = *dbPath
-	cfg.Server.Port = *port
+
+	cfg := config.DefaultConfig()
+	if err := cfg.LoadFromEnv(); err != nil {
+		log.Fatalf("Failed to load environment configuration: %v", err)
+	}
+	applyFlagOverrides(cfg, flag.CommandLine, *dbPath, *port)
 
 	// Initialize database
 	db, err := storage.NewDB(cfg.Database.Path)
@@ -42,10 +89,10 @@ func main() {
 
 	// Initialize Podman engine
 	podmanConfig := sandbox.EngineConfig{
-		SocketPath:      cfg.Podman.SocketPath,
-		ImageName:       cfg.Podman.ImageName,
-		APIVersion:      cfg.Podman.APIVersion,
-		RequestTimeout:  cfg.Podman.RequestTimeout,
+		SocketPath:       cfg.Podman.SocketPath,
+		ImageName:        cfg.Podman.ImageName,
+		APIVersion:       cfg.Podman.APIVersion,
+		RequestTimeout:   cfg.Podman.RequestTimeout,
 		ContainerTimeout: cfg.Podman.ContainerTimeout,
 	}
 	if podmanConfig.SocketPath == "" {

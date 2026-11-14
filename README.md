@@ -76,6 +76,17 @@ curl "http://127.0.0.1:8080/api/runs?agent_id=<AGENT_ID>"
 | `HORIZON_PORT` | `8080` | HTTP server port |
 | `HORIZON_SOCKET` | `$XDG_RUNTIME_DIR/podman/podman.sock` | Podman socket path |
 | `HORIZON_IMAGE` | `localhost/horizon-sandbox:latest` | Sandbox container image |
+| `HORIZON_REQUEST_TIMEOUT` | `30s` | Podman API request timeout |
+| `HORIZON_CONTAINER_TIMEOUT` | `10m` | Maximum duration of one container execution |
+| `HORIZON_AGENT_TIMEOUT` | `10m` | Configured default agent timeout; not yet enforced by the run executor |
+
+At startup, Horizon applies configuration in this order: built-in defaults, optional
+`.env` entries, inherited process environment, then explicitly supplied `--db` and
+`--port` flags. The `.env` file supports one unquoted `KEY=VALUE` entry per line;
+blank lines, `#` comments, and malformed lines are ignored. Timeout values use Go
+duration syntax and must be greater than zero (for example, `30s` or `10m`). Horizon
+exits at startup when `HORIZON_PORT` is not an integer from 1 through 65535 or a
+configured timeout is invalid.
 
 ## Project Structure
 
@@ -99,7 +110,7 @@ horizon/
 ├── project.md                  # Product spec & roadmap
 ├── run.md                      # Operations guide
 ├── explainer.md                # Technical documentation
-└── .env                        # Environment template
+└── .env                        # Optional local environment overrides (ignored by Git)
 ```
 
 ## Capabilities (Phase 1)

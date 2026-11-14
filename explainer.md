@@ -166,7 +166,15 @@ type AgentConfig struct {
 }
 ```
 
-**`DefaultConfig()`** returns zero-value struct with sensible defaults. Flags in `main.go` override `Database.Path` and `Server.Port`. Future: load from file (`--config`).
+**`DefaultConfig()`** returns a configuration with sensible defaults. Optional `.env` values, inherited environment variables, and explicitly supplied `--db` / `--port` flags override those defaults in that order. File-based configuration is not implemented and no `--config` flag is exposed.
+
+`LoadFromEnv()` configures `HORIZON_DB_PATH`, `HORIZON_PORT`, `HORIZON_SOCKET`,
+`HORIZON_IMAGE`, `HORIZON_REQUEST_TIMEOUT`, `HORIZON_CONTAINER_TIMEOUT`, and
+`HORIZON_AGENT_TIMEOUT`. It rejects a nonnumeric or out-of-range port and zero,
+negative, or invalid timeout durations. The daemon loads the optional `.env` file
+before invoking `LoadFromEnv()`; the loader accepts unquoted `KEY=VALUE` lines and
+does not overwrite a value inherited from the process environment. `HORIZON_AGENT_TIMEOUT`
+is currently configuration only—the run executor does not yet enforce it.
 
 ---
 
