@@ -33,7 +33,7 @@ horizon/
 │   ├── cagent/                     # cagent integration layer
 │   │   └── adapter.go              # Adapter interface + DefaultAdapter (BuildConfig, ValidateConfig, Execute stub)
 │   ├── storage/                    # SQLite persistence
-│   │   ├── sqlite.go               # DB wrapper, migrations, AgentRepository, RunRepository, scan functions, ToAgentDomain/ToRunDomain converters
+│   │   ├── sqlite.go               # DB wrapper, transactional versioned migrations, repositories, scan functions
 │   │   └── migrations/
 │   │       ├── 001_create_agents.sql   # Agents table + index
 │   │       └── 002_create_runs.sql     # Runs table + indexes + FK to agents
@@ -53,7 +53,7 @@ horizon/
 ├── project.md                      # Product spec and roadmap
 ├── run.md                          # Operations guide (health check, curl examples, capabilities, troubleshooting)
 ├── explainer.md                    # This file
-└── .env                            # Environment variables template
+└── .env                            # Optional local environment overrides (ignored by Git)
 ```
 
 ---
@@ -114,9 +114,9 @@ import (
 ```
 
 **Responsibilities**:
-1. **Flag parsing** — `config` (file path), `db` (database path, default `./data/horizon.db`), `port` (default 8080), `health-check` (bool)
+1. **Flag parsing** — `db` (database path, default `./data/horizon.db`), `port` (default 8080), `health-check` (bool)
 2. **Config loading** — `config.DefaultConfig()` with flag overrides
-3. **Database init** — `storage.NewDB(path)` runs migrations automatically
+3. **Database init** — `storage.NewDB(path)` creates a missing parent directory for file-backed databases, enables foreign keys, and runs migrations automatically
 4. **Podman engine init** — `sandbox.NewEngine(config)` with defaults from `DefaultEngineConfig()`
 5. **Health-check mode** — `--health-check` runs `engine.HealthCheck()` and exits
 6. **Repositories** — `storage.NewAgentRepository(db)`, `storage.NewRunRepository(db)`
@@ -421,11 +421,13 @@ type DefaultAdapter struct {
 
 ### 12. `internal/storage/sqlite.go` — SQLite Persistence (Full Implementation)
 
-**`DB` struct**: Wraps `*sql.DB` with `runMigrations()` called on `NewDB()`.
+**`DB` struct**: Wraps `*sql.DB` with `runMigrations()` called on `NewDB()`. Ordinary file paths receive a missing parent directory automatically; `:memory:` and SQLite memory URIs do not create directories. The connection enables SQLite foreign-key enforcement before application queries run.
 
-**Migrations** (executed in order):
-1. `createAgentsTable` — agents table with indexes
-2. `createRunsTable` — runs table with FK to agents + indexes
+**Migrations**:
+1. SQL files under `internal/storage/migrations/` are the canonical schema source and are embedded into the binary at build time.
+2. `schema_migrations` records an integer version, migration name, and UTC application timestamp.
+3. Pending migrations are applied and recorded in one transaction, in ascending version order. Reopening an existing database leaves already recorded migrations untouched and preserves durable data.
+4. Existing pre-version-table databases remain compatible because the initial migrations use `CREATE TABLE IF NOT EXISTS` before their versions are recorded.
 
 **`AgentRepository`**:
 - `Save(ctx, *AgentRow)` — UPSERT with `ON CONFLICT(id) DO UPDATE`
@@ -440,22 +442,6 @@ type DefaultAdapter struct {
 - `ListByAgentID(ctx, agentID)` — SELECT WHERE agent_id ORDER BY started_at DESC
 - `DeleteByAgentID(ctx, agentID)` — DELETE WHERE agent_id
 - `scanRun` — scans into `RunRow` (sql.Null* for nullable fields)
-
-**Domain converters** (on row types):
-```go
-func (row *AgentRow) ToAgentDomain() *AgentDefinition {
-	// Unmarshals JSON fields, reconstructs ScheduleConfig
-}
-
-func (row *RunRow) ToRunDomain() RunRecord {
-	// Converts sql.Null* → pointers, returns storage.RunRecord
-}
-```
-
-**Storage-layer types** (for converters):
-- `AgentDefinition` — same fields as domain but `Schedule *ScheduleConfig`, JSON as `json.RawMessage`
-- `ScheduleConfig` — CronExpression, Timezone, Enabled
-- `RunRecord` — flat fields with `*time.Time`, `*int` for nullable
 
 ---
 
@@ -502,6 +488,9 @@ CREATE INDEX IF NOT EXISTS idx_runs_agent_id ON runs(agent_id);
 CREATE INDEX IF NOT EXISTS idx_runs_started_at ON runs(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
 ```
+
+The files above are embedded by `sqlite.go`; they are not duplicated as Go string
+constants. Add future changes as a new, additive, numerically ordered migration file.
 
 ---
 

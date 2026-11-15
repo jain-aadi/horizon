@@ -74,10 +74,10 @@ func TestCreateAgentAssignsLifecycleFieldsAndDefaultImage(t *testing.T) {
 
 func TestCreateAgentRejectsInvalidDefinitions(t *testing.T) {
 	tests := []struct {
-		name          string
-		defaultImage  string
-		mutate        func(*AgentDefinition)
-		wantFieldName string
+		name           string
+		noDefaultImage bool
+		mutate         func(*AgentDefinition)
+		wantFieldName  string
 	}{
 		{
 			name: "missing name",
@@ -101,9 +101,9 @@ func TestCreateAgentRejectsInvalidDefinitions(t *testing.T) {
 			wantFieldName: "instructions",
 		},
 		{
-			name:          "missing runtime image without default",
-			defaultImage:  "",
-			wantFieldName: "runtime_config.image",
+			name:           "missing runtime image without default",
+			noDefaultImage: true,
+			wantFieldName:  "runtime_config.image",
 		},
 		{
 			name: "runtime image contains whitespace",
@@ -130,9 +130,9 @@ func TestCreateAgentRejectsInvalidDefinitions(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			defaultImage := tt.defaultImage
-			if defaultImage == "" && tt.name != "missing runtime image without default" {
-				defaultImage = testDefaultImage
+			defaultImage := testDefaultImage
+			if tt.noDefaultImage {
+				defaultImage = ""
 			}
 			service := newTestService(t, defaultImage)
 			definition := validAgentDefinition()
@@ -166,7 +166,6 @@ func TestUpdateAgentPreservesCreationFieldsAndIncrementsVersion(t *testing.T) {
 	originalCreatedAt := definition.CreatedAt
 	originalUpdatedAt := definition.UpdatedAt
 
-	time.Sleep(time.Millisecond)
 	definition.Name = "Updated daily brief"
 	definition.CreatedAt = time.Time{}
 	definition.UpdatedAt = time.Time{}
@@ -186,5 +185,19 @@ func TestUpdateAgentPreservesCreationFieldsAndIncrementsVersion(t *testing.T) {
 	}
 	if definition.Version != 2 {
 		t.Errorf("Version = %d, want 2", definition.Version)
+	}
+
+	stored, err := service.GetAgent(context.Background(), originalID)
+	if err != nil {
+		t.Fatalf("GetAgent() after update error = %v", err)
+	}
+	if stored.Name != "Updated daily brief" {
+		t.Errorf("stored Name = %q, want %q", stored.Name, "Updated daily brief")
+	}
+	if stored.CreatedAt != originalCreatedAt {
+		t.Errorf("stored CreatedAt = %s, want %s", stored.CreatedAt, originalCreatedAt)
+	}
+	if stored.Version != 2 {
+		t.Errorf("stored Version = %d, want 2", stored.Version)
 	}
 }

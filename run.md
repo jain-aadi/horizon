@@ -187,7 +187,7 @@ kill $SERVER_PID
 
 ## What Happens on First Run
 
-1. SQLite database `./data/horizon.db` is created with schema migrations
+1. The parent directory for SQLite database `./data/horizon.db` is created when needed; versioned schema migrations are applied and recorded in `schema_migrations`
 2. Agent and run repositories initialize
 3. Podman engine connects to socket (health check verifies)
 4. HTTP API serves on `127.0.0.1:8080`

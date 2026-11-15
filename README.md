@@ -93,6 +93,14 @@ duration syntax and must be greater than zero (for example, `30s` or `10m`). Hor
 exits at startup when `HORIZON_PORT` is not an integer from 1 through 65535 or a
 configured timeout is invalid.
 
+## Storage Startup and Upgrades
+
+For a normal file path, Horizon creates a missing parent directory before opening
+SQLite. Startup applies the versioned SQL migrations embedded from
+`internal/storage/migrations/` and records each successful version in
+`schema_migrations`. Existing data is retained on restart; schema changes must be
+added as a new, additive migration rather than by editing an already applied one.
+
 ## Project Structure
 
 ```
@@ -103,7 +111,7 @@ horizon/
 │   ├── run/                    # Run domain (model, coordinator, repository)
 │   ├── scheduler/              # Phase 4: cron, scheduling
 │   ├── cagent/                 # cagent adapter (stub)
-│   ├── storage/sqlite.go       # SQLite persistence + migrations
+│   ├── storage/sqlite.go       # SQLite persistence + versioned embedded migrations
 │   ├── permissions/            # Permission types & validation
 │   ├── config/config.go        # Application configuration
 │   ├── api/handler.go          # HTTP handlers (CRUD + execution)

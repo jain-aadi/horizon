@@ -3,9 +3,13 @@ package storage
 import (
 	"context"
 	"database/sql"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -15,6 +19,31 @@ var (
 	ErrNotFound = errors.New("record not found")
 )
 
+//go:embed migrations/001_create_agents.sql
+var createAgentsTable string
+
+//go:embed migrations/002_create_runs.sql
+var createRunsTable string
+
+type migration struct {
+	version int
+	name    string
+	sql     string
+}
+
+var migrations = []migration{
+	{version: 1, name: "create_agents", sql: createAgentsTable},
+	{version: 2, name: "create_runs", sql: createRunsTable},
+}
+
+const createSchemaMigrationsTable = `
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    applied_at DATETIME NOT NULL
+);
+`
+
 // DB wraps the database connection and provides migration support.
 type DB struct {
 	*sql.DB
@@ -22,34 +51,114 @@ type DB struct {
 
 // NewDB opens a SQLite database and runs migrations.
 func NewDB(path string) (*DB, error) {
-	db, err := sql.Open("sqlite", path+"?_foreign_keys=on&_busy_timeout=5000")
+	if err := ensureDatabaseDirectory(path); err != nil {
+		return nil, fmt.Errorf("prepare database directory: %w", err)
+	}
+
+	db, err := sql.Open("sqlite", sqliteDSN(path))
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 
 	if err := db.Ping(); err != nil {
+		db.Close()
 		return nil, fmt.Errorf("ping database: %w", err)
+	}
+	if _, err := db.Exec(`PRAGMA foreign_keys = ON`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("enable foreign keys: %w", err)
 	}
 
 	d := &DB{db}
 	if err := d.runMigrations(); err != nil {
+		db.Close()
 		return nil, fmt.Errorf("run migrations: %w", err)
 	}
 
 	return d, nil
 }
 
-// runMigrations executes all schema migrations in order.
-func (d *DB) runMigrations() error {
-	migrations := []string{
-		createAgentsTable,
-		createRunsTable,
+func ensureDatabaseDirectory(path string) error {
+	if strings.TrimSpace(path) == "" {
+		return errors.New("database path is required")
+	}
+	if path == ":memory:" || strings.Contains(strings.ToLower(path), "mode=memory") || strings.HasPrefix(path, "file:") {
+		return nil
 	}
 
-	for i, migration := range migrations {
-		if _, err := d.Exec(migration); err != nil {
-			return fmt.Errorf("migration %d failed: %w", i+1, err)
+	directory := filepath.Dir(path)
+	if directory == "." || directory == "" {
+		return nil
+	}
+	return os.MkdirAll(directory, 0o700)
+}
+
+func sqliteDSN(path string) string {
+	separator := "?"
+	if strings.Contains(path, "?") {
+		separator = "&"
+	}
+	return path + separator + "_foreign_keys=on&_busy_timeout=5000"
+}
+
+// runMigrations applies each embedded migration exactly once in version order.
+func (d *DB) runMigrations() error {
+	if err := validateMigrations(migrations); err != nil {
+		return err
+	}
+
+	tx, err := d.Begin()
+	if err != nil {
+		return fmt.Errorf("begin migration transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(createSchemaMigrationsTable); err != nil {
+		return fmt.Errorf("create schema migration table: %w", err)
+	}
+
+	for _, migration := range migrations {
+		var appliedVersion int
+		err := tx.QueryRow(`SELECT version FROM schema_migrations WHERE version = ?`, migration.version).Scan(&appliedVersion)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			if _, err := tx.Exec(migration.sql); err != nil {
+				return fmt.Errorf("apply migration %d (%s): %w", migration.version, migration.name, err)
+			}
+			if _, err := tx.Exec(
+				`INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)`,
+				migration.version,
+				migration.name,
+				time.Now().UTC(),
+			); err != nil {
+				return fmt.Errorf("record migration %d (%s): %w", migration.version, migration.name, err)
+			}
+		case err != nil:
+			return fmt.Errorf("check migration %d (%s): %w", migration.version, migration.name, err)
 		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit migrations: %w", err)
+	}
+	return nil
+}
+
+func validateMigrations(migrations []migration) error {
+	previousVersion := 0
+	for _, migration := range migrations {
+		if migration.version <= previousVersion {
+			return fmt.Errorf("migration versions must be strictly increasing: %d follows %d", migration.version, previousVersion)
+		}
+		if strings.TrimSpace(migration.name) == "" {
+			return fmt.Errorf("migration %d has an empty name", migration.version)
+		}
+		if strings.TrimSpace(migration.sql) == "" {
+			return fmt.Errorf("migration %d (%s) is empty", migration.version, migration.name)
+		}
+		previousVersion = migration.version
 	}
 	return nil
 }
@@ -263,46 +372,3 @@ func (r *RunRepository) scanRun(scanner interface {
 	}
 	return &row, nil
 }
-
-// Migration SQL statements
-const createAgentsTable = `
-CREATE TABLE IF NOT EXISTS agents (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    description TEXT,
-    goal TEXT NOT NULL,
-    instructions TEXT NOT NULL,
-    runtime_config TEXT NOT NULL DEFAULT '{}',
-    model_config TEXT NOT NULL DEFAULT '{}',
-    capabilities TEXT NOT NULL DEFAULT '[]',
-    permissions TEXT NOT NULL DEFAULT '{}',
-    schedule TEXT,
-    created_at DATETIME NOT NULL,
-    updated_at DATETIME NOT NULL,
-    version INTEGER NOT NULL DEFAULT 1
-);
-
-CREATE INDEX IF NOT EXISTS idx_agents_created_at ON agents(created_at DESC);
-`
-
-const createRunsTable = `
-CREATE TABLE IF NOT EXISTS runs (
-    id TEXT PRIMARY KEY,
-    agent_id TEXT NOT NULL,
-    agent_version INTEGER NOT NULL,
-    trigger_type TEXT NOT NULL,
-    status TEXT NOT NULL,
-    started_at DATETIME NOT NULL,
-    completed_at DATETIME,
-    exit_code INTEGER,
-    output_ref TEXT,
-    error_message TEXT,
-    container_id TEXT,
-    cancel_reason TEXT,
-    FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE
-);
-
-CREATE INDEX IF NOT EXISTS idx_runs_agent_id ON runs(agent_id);
-CREATE INDEX IF NOT EXISTS idx_runs_started_at ON runs(started_at DESC);
-CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
-`
