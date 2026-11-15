@@ -53,7 +53,7 @@ curl http://127.0.0.1:8080/api/health
 # Create an agent
 curl -X POST http://127.0.0.1:8080/api/agents \
   -H "Content-Type: application/json" \
-  -d '{"name":"test-agent","goal":"Report status","instructions":"Say hello","model_config":{"provider":"google","model":"gemini-3.5-flash-lite"}}'
+  -d '{"name":"test-agent","goal":"Report status","instructions":"Say hello","model_config":{"provider":"google","model":"gemini-3.5-flash-lite"},"permissions":{"network_access":true},"runtime_config":{"resource_limits":{"cpu_limit":"0.5","memory_limit":"256MiB","timeout":"5m"}}}'
 
 # List agents
 curl http://127.0.0.1:8080/api/agents
@@ -74,10 +74,15 @@ curl -X POST "http://127.0.0.1:8080/api/runs/<RUN_ID>?action=cancel" \
   -d '{"reason":"No longer needed"}'
 ```
 
-Agent creation requires `name`, `goal`, `instructions`, and a Google
-`model_config.provider` / `model_config.model`. If `runtime_config.image` is omitted,
-Horizon applies the configured default image. Validation failures return HTTP `400`
-with JSON in the form `{"error":"validation_error","field":"...","message":"..."}`.
+Agent creation requires `name`, `goal`, `instructions`, a Google
+`model_config.provider` / `model_config.model`, and an explicit
+`permissions.network_access: true` approval. Google provider calls need egress, so
+Horizon rejects an agent that does not explicitly approve it. `runtime_config.image`
+defaults to the configured image; it cannot select an image other than that global
+policy image at execution. Optional `runtime_config.resource_limits` accepts a positive
+decimal `cpu_limit`, an integer `memory_limit` with `B`, `KB`, `KiB`, `MB`, `MiB`,
+`GB`, or `GiB`, and a positive Go-duration `timeout`. Validation failures return HTTP
+`400` with JSON in the form `{"error":"validation_error","field":"...","message":"..."}`.
 
 ## Docker Agent Configuration Contract
 
@@ -86,10 +91,19 @@ under `<database-directory>/runs/<RUN_ID>/`. It converts the saved agent definit
 the pinned Docker Agent v1.158.0 schema-`16` YAML through `gopkg.in/yaml.v3`, then runs
 that exact generated `agent.yaml` in Podman. It never uses a shared project-root YAML.
 
-Capabilities, filesystem/network/shell/secret permissions, model API-key references,
-and arbitrary model parameters are rejected during run materialization rather than
-silently represented in YAML. Credentials continue to come only from the daemon's
-execution environment, never from HTTP input or generated agent YAML.
+Capabilities, filesystem/shell/secret permissions, model API-key references, and
+arbitrary model parameters are rejected during run materialization rather than silently
+represented in YAML. Network approval is enforced at container creation: approved runs
+use rootless `slirp4netns` egress with host-loopback disabled; unapproved network access
+is not accepted for the current Google-only provider. Horizon does not yet restrict
+approved egress to specific destinations. Credentials continue to come only from the
+daemon's execution environment, never from HTTP input or generated agent YAML.
+
+The Podman create request is policy-owned: it permits only the configured image, mounts
+only the per-run workspace read-only, drops all Linux capabilities, sets
+`no-new-privileges`, limits the container to 256 PIDs, and maps saved CPU/memory limits
+to Podman `NanoCpus`/`Memory`. An agent timeout may shorten but never exceed
+`HORIZON_CONTAINER_TIMEOUT`; no caller-supplied environment map reaches the container.
 
 Run logs are captured to a bounded local `output.log` in that workspace. The database
 stores only a safe relative output reference; retrieve it through

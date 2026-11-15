@@ -62,7 +62,15 @@ func newTestService(t *testing.T, executor run.Executor, timeout time.Duration, 
 				if err != nil {
 					return nil, err
 				}
-				return &run.AgentSnapshot{ID: definition.ID, Version: definition.Version, Definition: definition}, nil
+				return &run.AgentSnapshot{
+					ID:         definition.ID,
+					Version:    definition.Version,
+					Definition: definition,
+					Execution: sandbox.ExecutionConfig{
+						Image:         definition.RuntimeConfig.Image,
+						NetworkAccess: definition.Permissions.NetworkAccess,
+					},
+				}, nil
 			},
 			Materialize: func(snapshot *run.AgentSnapshot) ([]byte, error) {
 				definition, ok := snapshot.Definition.(*agent.AgentDefinition)
@@ -91,6 +99,7 @@ func createTestAgent(t *testing.T, service *agent.Service) *agent.AgentDefinitio
 			Provider: "google",
 			Model:    "gemini-3.5-flash-lite",
 		},
+		Permissions: agent.Permissions{NetworkAccess: true},
 	}
 	if err := service.CreateAgent(context.Background(), definition); err != nil {
 		t.Fatalf("CreateAgent() error = %v", err)
@@ -123,6 +132,9 @@ func TestServiceMaterializesConfigAndPersistsBoundedOutput(t *testing.T) {
 		runFn: func(_ context.Context, opts sandbox.RunOptions) (*sandbox.RunResult, error) {
 			if opts.YAMLFile != "agent.yaml" {
 				t.Errorf("YAMLFile = %q, want container-relative agent.yaml", opts.YAMLFile)
+			}
+			if opts.Execution.Image != runTestImage || !opts.Execution.NetworkAccess {
+				t.Errorf("Execution = %#v, want saved image and approved network access", opts.Execution)
 			}
 			if opts.OnContainerCreated != nil {
 				opts.OnContainerCreated("container-success")

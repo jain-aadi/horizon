@@ -3,6 +3,8 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
+	"math"
+	"strconv"
 	"strings"
 	"time"
 
@@ -42,6 +44,68 @@ type ResourceLimits struct {
 	CPULimit    string `json:"cpu_limit,omitempty"`
 	MemoryLimit string `json:"memory_limit,omitempty"`
 	Timeout     string `json:"timeout,omitempty"`
+}
+
+// ContainerTimeout parses the optional per-agent container timeout request.
+// A zero duration means the global Podman timeout policy applies.
+func (limits ResourceLimits) ContainerTimeout() (time.Duration, error) {
+	if strings.TrimSpace(limits.Timeout) == "" {
+		return 0, nil
+	}
+	timeout, err := time.ParseDuration(limits.Timeout)
+	if err != nil {
+		return 0, err
+	}
+	if timeout <= 0 {
+		return 0, fmt.Errorf("must be greater than zero")
+	}
+	return timeout, nil
+}
+
+// PodmanResources parses CPU and memory limits into Podman-compatible units.
+// Empty limits remain unset so no implicit resource limit is introduced.
+func (limits ResourceLimits) PodmanResources() (nanoCPUs, memoryBytes int64, err error) {
+	if raw := strings.TrimSpace(limits.CPULimit); raw != "" {
+		cpus, parseErr := strconv.ParseFloat(raw, 64)
+		if parseErr != nil || math.IsNaN(cpus) || math.IsInf(cpus, 0) || cpus <= 0 {
+			return 0, 0, fmt.Errorf("cpu_limit must be a positive decimal CPU count")
+		}
+		if cpus > float64(math.MaxInt64)/1_000_000_000 {
+			return 0, 0, fmt.Errorf("cpu_limit is too large")
+		}
+		nanoCPUs = int64(math.Round(cpus * 1_000_000_000))
+		if nanoCPUs <= 0 {
+			return 0, 0, fmt.Errorf("cpu_limit is too small")
+		}
+	}
+
+	if raw := strings.TrimSpace(limits.MemoryLimit); raw != "" {
+		value := strings.ToLower(raw)
+		multiplier := int64(1)
+		for _, unit := range []struct {
+			suffix     string
+			multiplier int64
+		}{
+			{"gib", 1 << 30}, {"gb", 1_000_000_000},
+			{"mib", 1 << 20}, {"mb", 1_000_000},
+			{"kib", 1 << 10}, {"kb", 1_000}, {"b", 1},
+		} {
+			if strings.HasSuffix(value, unit.suffix) {
+				value = strings.TrimSpace(strings.TrimSuffix(value, unit.suffix))
+				multiplier = unit.multiplier
+				break
+			}
+		}
+		amount, parseErr := strconv.ParseInt(value, 10, 64)
+		if parseErr != nil || amount <= 0 {
+			return 0, 0, fmt.Errorf("memory_limit must be a positive integer with an optional B, KB, KiB, MB, MiB, GB, or GiB suffix")
+		}
+		if amount > math.MaxInt64/multiplier {
+			return 0, 0, fmt.Errorf("memory_limit is too large")
+		}
+		memoryBytes = amount * multiplier
+	}
+	return nanoCPUs, memoryBytes, nil
 }
 
 // ModelConfig holds model/provider configuration.
@@ -118,6 +182,15 @@ func (def *AgentDefinition) Validate() error {
 	}
 	if def.ModelConfig.Model == "" {
 		return &ValidationError{Field: "model_config.model", Message: "is required"}
+	}
+	if !def.Permissions.NetworkAccess {
+		return &ValidationError{Field: "permissions.network_access", Message: "must be approved for the Google provider"}
+	}
+	if _, err := def.RuntimeConfig.ResourceLimits.ContainerTimeout(); err != nil {
+		return &ValidationError{Field: "runtime_config.resource_limits.timeout", Message: err.Error()}
+	}
+	if _, _, err := def.RuntimeConfig.ResourceLimits.PodmanResources(); err != nil {
+		return &ValidationError{Field: "runtime_config.resource_limits", Message: err.Error()}
 	}
 	return nil
 }

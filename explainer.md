@@ -417,12 +417,22 @@ the Horizon goal and instructions; `description` uses the saved description or f
 back to the agent name.
 
 The configuration is serialized through `gopkg.in/yaml.v3`, then validated before it
-is returned. The adapter deliberately rejects capabilities, filesystem/network/shell/
-secret permissions, model API-key references, and arbitrary model parameters: Docker
-Agent YAML alone cannot enforce Horizon's execution policy. Credentials remain outside
-the YAML and are supplied by the controlled execution environment. The run service
-calls this adapter for every accepted run and writes the resulting configuration to the
-run's isolated workspace before container creation.
+is returned. The adapter deliberately rejects capabilities, filesystem/shell/secret
+permissions, model API-key references, and arbitrary model parameters: Docker Agent
+YAML alone cannot enforce Horizon's execution policy. Network access is instead an
+explicit saved approval enforced by the Podman execution boundary for the current
+Google-only provider. Credentials remain outside the YAML and are supplied by the
+controlled execution environment. The run service calls this adapter for every accepted
+run and writes the resulting configuration to the run's isolated workspace before
+container creation.
+
+The execution boundary accepts only the configured image, a container-relative YAML
+path in the read-only per-run workspace, and the allowlisted Google credential. It
+creates containers with dropped capabilities, `no-new-privileges`, a 256-process cap,
+rootless egress only when approved (with host loopback disabled), and parsed CPU/memory
+limits. Agent timeouts can shorten, but cannot exceed, the configured container timeout.
+Podman create/start/log/wait/remove failures include bounded, credential-redacted
+diagnostics; cleanup errors are logged without replacing the primary run result.
 
 ---
 

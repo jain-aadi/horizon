@@ -54,6 +54,7 @@ type AgentSnapshot struct {
 	ID         string
 	Version    int
 	Definition any
+	Execution  sandbox.ExecutionConfig
 }
 
 // AgentLookup loads the agent definition that a run will snapshot before launch.
@@ -179,6 +180,7 @@ func (s *Service) execute(ctx context.Context, runID string, snapshot *AgentSnap
 		Prompt:       prompt,
 		APIKey:       s.config.APIKey,
 		OutputWriter: writer,
+		Execution:    snapshot.Execution,
 		OnContainerCreated: func(containerID string) {
 			s.recordContainerID(runID, containerID)
 		},

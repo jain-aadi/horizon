@@ -5,13 +5,17 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"time"
 )
 
@@ -60,6 +64,10 @@ type hostConfig struct {
 	AutoRemove  bool      `json:"AutoRemove,omitempty"`
 	NetworkMode string    `json:"NetworkMode,omitempty"`
 	CapDrop     []string  `json:"CapDrop,omitempty"`
+	NanoCPUs    int64     `json:"NanoCpus,omitempty"`
+	Memory      int64     `json:"Memory,omitempty"`
+	PidsLimit   int64     `json:"PidsLimit,omitempty"`
+	SecurityOpt []string  `json:"SecurityOpt,omitempty"`
 	LogConfig   logConfig `json:"LogConfig,omitempty"`
 }
 
@@ -129,8 +137,18 @@ type RunOptions struct {
 	Prompt             string
 	APIKey             string
 	OutputWriter       io.Writer
-	Env                map[string]string
+	Execution          ExecutionConfig
 	OnContainerCreated func(containerID string)
+}
+
+// ExecutionConfig is the validated runtime configuration for one execution.
+// The engine applies global policy before converting it into Podman settings.
+type ExecutionConfig struct {
+	Image            string
+	NetworkAccess    bool
+	ContainerTimeout time.Duration
+	NanoCPUs         int64
+	MemoryBytes      int64
 }
 
 // RunResult contains the result of a run.
@@ -144,30 +162,35 @@ type RunResult struct {
 // Output is streamed to out in real time. On any failure, output is captured
 // and included in the returned error.
 func (e *Engine) RunAgent(ctx context.Context, opts RunOptions) (*RunResult, error) {
+	execution, err := e.resolveExecution(opts.Execution)
+	if err != nil {
+		return nil, err
+	}
 	absWorkspace, err := filepath.Abs(opts.WorkspaceDir)
 	if err != nil {
 		return nil, fmt.Errorf("resolve workspace path: %w", err)
 	}
 
-	// Build environment variables
+	// Only the provider credential is injected from the daemon's secure environment.
 	env := []string{}
-	for k, v := range opts.Env {
-		env = append(env, fmt.Sprintf("%s=%s", k, v))
-	}
 	if opts.APIKey != "" {
 		env = append(env, "GOOGLE_API_KEY="+opts.APIKey)
 	}
 
 	payload := createReq{
-		Img:        e.config.ImageName,
+		Img:        execution.Image,
 		Cmd:        e.buildCmd(opts.YAMLFile, opts.Prompt),
 		Env:        env,
 		WorkingDir: "/workspace",
 		HostConfig: hostConfig{
 			Binds:       []string{fmt.Sprintf("%s:/workspace:ro,Z", absWorkspace)},
 			AutoRemove:  false,
-			NetworkMode: "slirp4netns",
+			NetworkMode: execution.networkMode,
 			CapDrop:     []string{"ALL"},
+			NanoCPUs:    execution.nanoCPUs,
+			Memory:      execution.memoryBytes,
+			PidsLimit:   256,
+			SecurityOpt: []string{"no-new-privileges"},
 			LogConfig:   logConfig{Type: "json-file"},
 		},
 	}
@@ -191,8 +214,7 @@ func (e *Engine) RunAgent(ctx context.Context, opts RunOptions) (*RunResult, err
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusCreated {
-		b, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("container create failed (%d): %s", resp.StatusCode, string(b))
+		return nil, fmt.Errorf("container create failed (%d): %s", resp.StatusCode, readDiagnostic(resp.Body, opts.APIKey))
 	}
 
 	var created createResp
@@ -200,20 +222,18 @@ func (e *Engine) RunAgent(ctx context.Context, opts RunOptions) (*RunResult, err
 		return nil, fmt.Errorf("decode container create response: %w", err)
 	}
 	containerID := created.ID
-	if opts.OnContainerCreated != nil {
-		opts.OnContainerCreated(containerID)
-	}
 
 	// Ensure cleanup runs even on error/panic
 	defer func() {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		delReq, _ := http.NewRequestWithContext(cleanupCtx, "DELETE",
-			fmt.Sprintf("http://d/%s/containers/%s?force=true", e.config.APIVersion, containerID), nil)
-		if delResp, err := e.httpClient.Do(delReq); err == nil {
-			delResp.Body.Close()
+		if err := e.removeContainer(containerID, opts.APIKey); err != nil {
+			log.Printf("Podman cleanup failed for container %s: %v", containerID, err)
+		} else {
+			log.Printf("Podman cleaned up container %s", containerID)
 		}
 	}()
+	if opts.OnContainerCreated != nil {
+		opts.OnContainerCreated(containerID)
+	}
 
 	// Start the container
 	startURL := fmt.Sprintf("http://d/%s/containers/%s/start", e.config.APIVersion, containerID)
@@ -228,41 +248,78 @@ func (e *Engine) RunAgent(ctx context.Context, opts RunOptions) (*RunResult, err
 	}
 
 	if startResp.StatusCode != http.StatusNoContent && startResp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(startResp.Body)
+		diagnostic := readDiagnostic(startResp.Body, opts.APIKey)
 		startResp.Body.Close()
-		return nil, fmt.Errorf("container start failed (%d): %s", startResp.StatusCode, string(b))
+		return nil, fmt.Errorf("container start failed (%d): %s", startResp.StatusCode, diagnostic)
 	}
 	startResp.Body.Close()
 
-	// Stream logs in real time
-	logCtx, logCancel := context.WithCancel(ctx)
-	defer logCancel()
-	if err := e.StreamLogs(logCtx, containerID, opts.OutputWriter); err != nil {
-		return nil, fmt.Errorf("log stream failed: %w", err)
+	// Run the bounded wait and follow-log requests concurrently. A follow stream
+	// normally ends only when the container exits, so it cannot be allowed to
+	// delay creation of the execution deadline.
+	executionCtx, executionCancel := context.WithTimeout(ctx, execution.ContainerTimeout)
+	defer executionCancel()
+
+	type waitOutcome struct {
+		result *RunResult
+		err    error
 	}
+	waitDone := make(chan waitOutcome, 1)
+	go func() {
+		result, err := e.waitForContainer(executionCtx, containerID, execution.ContainerTimeout, opts.APIKey)
+		waitDone <- waitOutcome{result: result, err: err}
+	}()
 
-	// Wait for the agent process to finish with timeout
-	waitCtx, waitCancel := context.WithTimeout(ctx, e.config.ContainerTimeout)
-	defer waitCancel()
+	logsDone := make(chan error, 1)
+	go func() {
+		logsDone <- e.streamLogs(executionCtx, containerID, opts.OutputWriter, opts.APIKey)
+	}()
 
+	select {
+	case wait := <-waitDone:
+		if wait.err != nil || (wait.result != nil && wait.result.Error != nil) {
+			executionCancel()
+			<-logsDone
+			return wait.result, wait.err
+		}
+		// A successful wait can arrive before Podman has flushed its final log
+		// frames. Keep the execution context alive until the stream reaches EOF.
+		if logErr := <-logsDone; logErr != nil {
+			return nil, fmt.Errorf("log stream failed: %w", logErr)
+		}
+		return wait.result, nil
+	case logErr := <-logsDone:
+		if logErr != nil {
+			executionCancel()
+			wait := <-waitDone
+			if errors.Is(executionCtx.Err(), context.DeadlineExceeded) {
+				return wait.result, wait.err
+			}
+			return nil, fmt.Errorf("log stream failed: %w", logErr)
+		}
+		wait := <-waitDone
+		return wait.result, wait.err
+	}
+}
+
+func (e *Engine) waitForContainer(ctx context.Context, containerID string, timeout time.Duration, providerSecret string) (*RunResult, error) {
 	waitURL := fmt.Sprintf("http://d/%s/containers/%s/wait?condition=not-running", e.config.APIVersion, containerID)
-	waitReq, err := http.NewRequestWithContext(waitCtx, "POST", waitURL, nil)
+	waitReq, err := http.NewRequestWithContext(ctx, "POST", waitURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("wait request: %w", err)
 	}
 
-	waitHTTPResp, err := e.httpClient.Do(waitReq)
+	waitHTTPResp, err := e.streamClient.Do(waitReq)
 	if err != nil {
-		if waitCtx.Err() == context.DeadlineExceeded {
-			return &RunResult{ContainerID: containerID, ExitCode: -1, Error: fmt.Errorf("container wait timeout after %v", e.config.ContainerTimeout)}, nil
+		if ctx.Err() == context.DeadlineExceeded {
+			return &RunResult{ContainerID: containerID, ExitCode: -1, Error: fmt.Errorf("container wait timeout after %v", timeout)}, nil
 		}
 		return nil, fmt.Errorf("container wait failed: %w", err)
 	}
 	defer waitHTTPResp.Body.Close()
 
 	if waitHTTPResp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(waitHTTPResp.Body)
-		return &RunResult{ContainerID: containerID, ExitCode: -1, Error: fmt.Errorf("container wait failed (%d): %s", waitHTTPResp.StatusCode, string(b))}, nil
+		return &RunResult{ContainerID: containerID, ExitCode: -1, Error: fmt.Errorf("container wait failed (%d): %s", waitHTTPResp.StatusCode, readDiagnostic(waitHTTPResp.Body, providerSecret))}, nil
 	}
 
 	var waitResult waitResp
@@ -290,6 +347,10 @@ func (e *Engine) buildCmd(yamlFile, prompt string) []string {
 
 // StreamLogs streams container logs to the output writer.
 func (e *Engine) StreamLogs(ctx context.Context, containerID string, out io.Writer) error {
+	return e.streamLogs(ctx, containerID, out, "")
+}
+
+func (e *Engine) streamLogs(ctx context.Context, containerID string, out io.Writer, providerSecret string) error {
 	logURL := fmt.Sprintf("http://d/%s/containers/%s/logs?follow=true&stdout=true&stderr=true", e.config.APIVersion, containerID)
 	logReq, err := http.NewRequestWithContext(ctx, "GET", logURL, nil)
 	if err != nil {
@@ -301,12 +362,19 @@ func (e *Engine) StreamLogs(ctx context.Context, containerID string, out io.Writ
 		return err
 	}
 	defer logResp.Body.Close()
+	if logResp.StatusCode != http.StatusOK {
+		return fmt.Errorf("container log stream failed (%d): %s", logResp.StatusCode, readDiagnostic(logResp.Body, providerSecret))
+	}
 
 	return demuxStream(logResp.Body, out)
 }
 
 // RemoveContainer forcefully removes a container.
 func (e *Engine) RemoveContainer(containerID string) error {
+	return e.removeContainer(containerID, "")
+}
+
+func (e *Engine) removeContainer(containerID string, providerSecret string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -321,7 +389,75 @@ func (e *Engine) RemoveContainer(containerID string) error {
 		return err
 	}
 	defer resp.Body.Close()
-	return nil
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotFound {
+		return nil
+	}
+	return fmt.Errorf("container removal failed (%d): %s", resp.StatusCode, readDiagnostic(resp.Body, providerSecret))
+}
+
+type resolvedExecution struct {
+	Image            string
+	ContainerTimeout time.Duration
+	networkMode      string
+	nanoCPUs         int64
+	memoryBytes      int64
+}
+
+func (e *Engine) resolveExecution(execution ExecutionConfig) (resolvedExecution, error) {
+	if execution.Image == "" {
+		return resolvedExecution{}, errors.New("runtime image is required")
+	}
+	if execution.Image != e.config.ImageName {
+		return resolvedExecution{}, fmt.Errorf("runtime image %q is not allowed by global policy", execution.Image)
+	}
+	if execution.NanoCPUs < 0 || execution.MemoryBytes < 0 {
+		return resolvedExecution{}, errors.New("runtime resource limits cannot be negative")
+	}
+
+	timeout := e.config.ContainerTimeout
+	if execution.ContainerTimeout > 0 {
+		if execution.ContainerTimeout > e.config.ContainerTimeout {
+			return resolvedExecution{}, fmt.Errorf("requested container timeout %v exceeds global maximum %v", execution.ContainerTimeout, e.config.ContainerTimeout)
+		}
+		timeout = execution.ContainerTimeout
+	}
+
+	networkMode := "none"
+	if execution.NetworkAccess {
+		networkMode = "slirp4netns:allow_host_loopback=false"
+	}
+	return resolvedExecution{
+		Image:            execution.Image,
+		ContainerTimeout: timeout,
+		networkMode:      networkMode,
+		nanoCPUs:         execution.NanoCPUs,
+		memoryBytes:      execution.MemoryBytes,
+	}, nil
+}
+
+const maxDiagnosticBytes = 4096
+
+var providerCredentialPattern = regexp.MustCompile(`(?i)(["']?GOOGLE_API_KEY["']?\s*(?:=|:)\s*["']?)[^\s"',}]+`)
+
+func readDiagnostic(reader io.Reader, secrets ...string) string {
+	data, err := io.ReadAll(io.LimitReader(reader, maxDiagnosticBytes+1))
+	if err != nil {
+		return "unable to read diagnostic"
+	}
+	diagnostic := strings.TrimSpace(string(data))
+	for _, secret := range secrets {
+		if secret != "" {
+			diagnostic = strings.ReplaceAll(diagnostic, secret, "[REDACTED]")
+		}
+	}
+	diagnostic = providerCredentialPattern.ReplaceAllString(diagnostic, "${1}[REDACTED]")
+	if len(data) > maxDiagnosticBytes {
+		if len(diagnostic) > maxDiagnosticBytes {
+			diagnostic = diagnostic[:maxDiagnosticBytes]
+		}
+		return diagnostic + "…"
+	}
+	return diagnostic
 }
 
 // HealthCheck verifies the Podman socket is reachable and the image exists.

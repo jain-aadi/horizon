@@ -15,6 +15,7 @@ import (
 	"github.com/jain-aadi/horizon/internal/agent"
 	"github.com/jain-aadi/horizon/internal/cagent"
 	"github.com/jain-aadi/horizon/internal/run"
+	"github.com/jain-aadi/horizon/internal/sandbox"
 	"github.com/jain-aadi/horizon/internal/storage"
 )
 
@@ -54,7 +55,26 @@ func NewHandler(agentRepo *storage.AgentRepository, runRepo *storage.RunReposito
 		if err != nil {
 			return nil, err
 		}
-		return &run.AgentSnapshot{ID: definition.ID, Version: definition.Version, Definition: definition}, nil
+		containerTimeout, err := definition.RuntimeConfig.ResourceLimits.ContainerTimeout()
+		if err != nil {
+			return nil, fmt.Errorf("parse agent container timeout: %w", err)
+		}
+		nanoCPUs, memoryBytes, err := definition.RuntimeConfig.ResourceLimits.PodmanResources()
+		if err != nil {
+			return nil, fmt.Errorf("parse agent resource limits: %w", err)
+		}
+		return &run.AgentSnapshot{
+			ID:         definition.ID,
+			Version:    definition.Version,
+			Definition: definition,
+			Execution: sandbox.ExecutionConfig{
+				Image:            definition.RuntimeConfig.Image,
+				NetworkAccess:    definition.Permissions.NetworkAccess,
+				ContainerTimeout: containerTimeout,
+				NanoCPUs:         nanoCPUs,
+				MemoryBytes:      memoryBytes,
+			},
+		}, nil
 	}, Materialize: func(snapshot *run.AgentSnapshot) ([]byte, error) {
 		definition, ok := snapshot.Definition.(*agent.AgentDefinition)
 		if !ok {

@@ -103,9 +103,6 @@ func validateSupportedDefinition(agentDef *agent.AgentDefinition) error {
 	if len(agentDef.Permissions.FilesystemAccess) > 0 {
 		return &UnsupportedFieldError{Field: "permissions.filesystem_access", Reason: "filesystem permissions require execution-boundary enforcement"}
 	}
-	if agentDef.Permissions.NetworkAccess {
-		return &UnsupportedFieldError{Field: "permissions.network_access", Reason: "network permissions require execution-boundary enforcement"}
-	}
 	if agentDef.Permissions.ShellAccess {
 		return &UnsupportedFieldError{Field: "permissions.shell_access", Reason: "shell permissions require execution-boundary enforcement"}
 	}

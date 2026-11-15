@@ -23,6 +23,7 @@ func validDefinition() *agent.AgentDefinition {
 			Provider: "google",
 			Model:    "gemini-3.5-flash-lite",
 		},
+		Permissions: agent.Permissions{NetworkAccess: true},
 	}
 }
 
@@ -93,13 +94,6 @@ func TestBuildConfigRejectsUnsupportedDefinitionFields(t *testing.T) {
 				definition.Permissions.FilesystemAccess = []string{"/workspace:ro"}
 			},
 			wantField: "permissions.filesystem_access",
-		},
-		{
-			name: "network access",
-			mutate: func(definition *agent.AgentDefinition) {
-				definition.Permissions.NetworkAccess = true
-			},
-			wantField: "permissions.network_access",
 		},
 		{
 			name: "shell access",

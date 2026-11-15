@@ -19,11 +19,16 @@ import (
 
 const handlerTestDefaultImage = "localhost/horizon-sandbox:test"
 
-type immediateEngine struct{}
+type immediateEngine struct {
+	t *testing.T
+}
 
 func (immediateEngine) HealthCheck(context.Context) error { return nil }
 
-func (immediateEngine) RunAgent(_ context.Context, opts sandbox.RunOptions) (*sandbox.RunResult, error) {
+func (e immediateEngine) RunAgent(_ context.Context, opts sandbox.RunOptions) (*sandbox.RunResult, error) {
+	if e.t != nil && (opts.Execution.Image != handlerTestDefaultImage || !opts.Execution.NetworkAccess || opts.Execution.NanoCPUs != 500_000_000 || opts.Execution.MemoryBytes != 64*1024*1024 || opts.Execution.ContainerTimeout != time.Second) {
+		e.t.Errorf("RunAgent() Execution = %#v, want saved image, approved network access, and parsed resource limits", opts.Execution)
+	}
 	if opts.OnContainerCreated != nil {
 		opts.OnContainerCreated("api-test-container")
 	}
@@ -45,7 +50,7 @@ func newTestServer(t *testing.T) *httptest.Server {
 	handler := NewHandler(
 		storage.NewAgentRepository(db),
 		storage.NewRunRepository(db),
-		immediateEngine{},
+		immediateEngine{t: t},
 		&Config{DefaultImage: handlerTestDefaultImage, DataDir: t.TempDir(), DefaultTimeout: time.Second},
 	)
 	mux := http.NewServeMux()
@@ -60,7 +65,7 @@ func TestCreateAgentAppliesServiceDefaults(t *testing.T) {
 	response, err := http.Post(
 		server.URL+"/api/agents",
 		"application/json",
-		strings.NewReader(`{"id":"client-controlled-id","name":"Daily brief","goal":"Prepare a concise daily brief.","instructions":"Summarize the configured input.","model_config":{"provider":"google","model":"gemini-3.5-flash-lite"}}`),
+		strings.NewReader(`{"id":"client-controlled-id","name":"Daily brief","goal":"Prepare a concise daily brief.","instructions":"Summarize the configured input.","model_config":{"provider":"google","model":"gemini-3.5-flash-lite"},"permissions":{"network_access":true}}`),
 	)
 	if err != nil {
 		t.Fatalf("POST /api/agents error = %v", err)
@@ -99,7 +104,7 @@ func TestCreateAgentReturnsStructuredValidationError(t *testing.T) {
 	response, err := http.Post(
 		server.URL+"/api/agents",
 		"application/json",
-		strings.NewReader(`{"goal":"Prepare a concise daily brief.","instructions":"Summarize the configured input.","model_config":{"provider":"google","model":"gemini-3.5-flash-lite"}}`),
+		strings.NewReader(`{"goal":"Prepare a concise daily brief.","instructions":"Summarize the configured input.","model_config":{"provider":"google","model":"gemini-3.5-flash-lite"},"permissions":{"network_access":true}}`),
 	)
 	if err != nil {
 		t.Fatalf("POST /api/agents error = %v", err)
@@ -139,7 +144,7 @@ func TestUpdateAgentPreservesServiceManagedFields(t *testing.T) {
 	createResponse, err := http.Post(
 		server.URL+"/api/agents",
 		"application/json",
-		strings.NewReader(`{"name":"Daily brief","goal":"Prepare a concise daily brief.","instructions":"Summarize the configured input.","model_config":{"provider":"google","model":"gemini-3.5-flash-lite"}}`),
+		strings.NewReader(`{"name":"Daily brief","goal":"Prepare a concise daily brief.","instructions":"Summarize the configured input.","model_config":{"provider":"google","model":"gemini-3.5-flash-lite"},"permissions":{"network_access":true}}`),
 	)
 	if err != nil {
 		t.Fatalf("POST /api/agents error = %v", err)
@@ -155,7 +160,7 @@ func TestUpdateAgentPreservesServiceManagedFields(t *testing.T) {
 	updateRequest, err := http.NewRequest(
 		http.MethodPut,
 		server.URL+"/api/agents/"+created.ID,
-		strings.NewReader(`{"id":"client-controlled-id","name":"Updated daily brief","goal":"Prepare a revised brief.","instructions":"Summarize the configured input in five bullet points.","model_config":{"provider":"google","model":"gemini-3.5-flash-lite"},"version":99}`),
+		strings.NewReader(`{"id":"client-controlled-id","name":"Updated daily brief","goal":"Prepare a revised brief.","instructions":"Summarize the configured input in five bullet points.","model_config":{"provider":"google","model":"gemini-3.5-flash-lite"},"permissions":{"network_access":true},"version":99}`),
 	)
 	if err != nil {
 		t.Fatalf("NewRequest() error = %v", err)
@@ -196,7 +201,7 @@ func TestCreateRunMaterializesAndServesOutput(t *testing.T) {
 	createAgentResponse, err := http.Post(
 		server.URL+"/api/agents",
 		"application/json",
-		strings.NewReader(`{"name":"Daily brief","goal":"Prepare a concise daily brief.","instructions":"Summarize the configured input.","model_config":{"provider":"google","model":"gemini-3.5-flash-lite"}}`),
+		strings.NewReader(`{"name":"Daily brief","goal":"Prepare a concise daily brief.","instructions":"Summarize the configured input.","model_config":{"provider":"google","model":"gemini-3.5-flash-lite"},"permissions":{"network_access":true},"runtime_config":{"resource_limits":{"cpu_limit":"0.5","memory_limit":"64MiB","timeout":"1s"}}}`),
 	)
 	if err != nil {
 		t.Fatalf("POST /api/agents error = %v", err)

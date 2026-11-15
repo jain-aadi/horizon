@@ -33,6 +33,7 @@ func validAgentDefinition() *AgentDefinition {
 			Provider: "google",
 			Model:    "gemini-3.5-flash-lite",
 		},
+		Permissions: Permissions{NetworkAccess: true},
 	}
 }
 
@@ -125,6 +126,34 @@ func TestCreateAgentRejectsInvalidDefinitions(t *testing.T) {
 				definition.ModelConfig.Model = ""
 			},
 			wantFieldName: "model_config.model",
+		},
+		{
+			name: "network access not approved",
+			mutate: func(definition *AgentDefinition) {
+				definition.Permissions.NetworkAccess = false
+			},
+			wantFieldName: "permissions.network_access",
+		},
+		{
+			name: "invalid container timeout",
+			mutate: func(definition *AgentDefinition) {
+				definition.RuntimeConfig.ResourceLimits.Timeout = "not-a-duration"
+			},
+			wantFieldName: "runtime_config.resource_limits.timeout",
+		},
+		{
+			name: "invalid cpu limit",
+			mutate: func(definition *AgentDefinition) {
+				definition.RuntimeConfig.ResourceLimits.CPULimit = "zero"
+			},
+			wantFieldName: "runtime_config.resource_limits",
+		},
+		{
+			name: "invalid memory limit",
+			mutate: func(definition *AgentDefinition) {
+				definition.RuntimeConfig.ResourceLimits.MemoryLimit = "5TB"
+			},
+			wantFieldName: "runtime_config.resource_limits",
 		},
 	}
 

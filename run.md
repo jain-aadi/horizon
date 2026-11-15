@@ -71,9 +71,20 @@ Podman engine supplies the `run --exec --last` arguments after the image entrypo
 The execution coordinator materializes the saved agent definition for every accepted
 run into `<database-directory>/runs/<RUN_ID>/agent.yaml`. It uses the Task 5 adapter's
 schema-`16` YAML with one `root` agent and one Google model; no shared project-root
-`agent.yaml` is used. Unsupported capabilities, filesystem/network/shell/secret
-permission requests, model API-key references, and arbitrary model parameters fail the
-run during materialization rather than silently weakening the requested policy.
+`agent.yaml` is used. Unsupported capabilities, filesystem/shell/secret permission
+requests, model API-key references, and arbitrary model parameters fail the run during
+materialization rather than silently weakening the requested policy. Google execution
+requires an explicit `permissions.network_access: true` approval. At the Podman boundary,
+Horizon allows only the configured image, mounts only `/workspace:ro,Z`, drops all
+capabilities, sets `no-new-privileges`, caps processes at 256, disables host loopback in
+rootless `slirp4netns`, and maps saved CPU/memory limits to the create request. The
+network approval does not yet provide destination-level egress filtering.
+
+A saved container timeout can shorten but never exceed `HORIZON_CONTAINER_TIMEOUT`.
+The engine rejects different images, oversized timeouts, malformed resource limits, and
+any generic caller-supplied environment settings. Only `GOOGLE_API_KEY` from the daemon
+environment is injected for the provider and it is never written to YAML or accepted
+through HTTP input.
 
 The same workspace holds a bounded `output.log`. The run row stores only a safe
 relative output reference, and `GET /api/runs/{id}/output` resolves it under the run
@@ -89,7 +100,7 @@ curl http://127.0.0.1:8080/api/health
 # Create an agent
 curl -X POST http://127.0.0.1:8080/api/agents \
   -H "Content-Type: application/json" \
-  -d '{"name":"test-agent","goal":"Report status","instructions":"Say hello","model_config":{"provider":"google","model":"gemini-3.5-flash-lite"}}'
+  -d '{"name":"test-agent","goal":"Report status","instructions":"Say hello","model_config":{"provider":"google","model":"gemini-3.5-flash-lite"},"permissions":{"network_access":true},"runtime_config":{"resource_limits":{"cpu_limit":"0.5","memory_limit":"256MiB","timeout":"5m"}}}'
 
 # List agents
 curl http://127.0.0.1:8080/api/agents
@@ -109,10 +120,13 @@ curl -X POST "http://127.0.0.1:8080/api/runs/<RUN_ID>?action=cancel" \
   -d '{"reason":"No longer needed"}'
 ```
 
-Agent creation requires `name`, `goal`, `instructions`, and a Google
-`model_config.provider` / `model_config.model`. Omit `runtime_config.image` to use
-the configured default image. Validation failures return HTTP `400` with JSON in the
-form `{"error":"validation_error","field":"...","message":"..."}`.
+Agent creation requires `name`, `goal`, `instructions`, a Google
+`model_config.provider` / `model_config.model`, and explicit
+`permissions.network_access: true`. Omit `runtime_config.image` to use the configured
+default image. Optional `runtime_config.resource_limits` accepts a positive decimal CPU
+count, a positive integer memory value with `B`, `KB`, `KiB`, `MB`, `MiB`, `GB`, or
+`GiB`, and a positive Go duration. Validation failures return HTTP `400` with JSON in
+the form `{"error":"validation_error","field":"...","message":"..."}`.
 
 ---
 
@@ -126,7 +140,8 @@ form `{"error":"validation_error","field":"...","message":"..."}`.
 | **Run execution** | Manual trigger materializes a saved definition into a per-run Docker Agent YAML workspace, then executes it in Podman |
 | **Persistence** | SQLite stores agent definitions, run history, schedules across restarts |
 | **Run status** | `queued` → `running` → `succeeded`/`failed`/`cancelled`/`timed_out` |
-| **Container management** | Auto-create, start, stream bounded output, wait for exit, and request removal on cancellation; engine cleanup also removes containers |
+| **Container management** | Auto-create, start, stream bounded output, wait for exit, request removal on cancellation, and clean up containers after every completed run |
+| **Runtime policy** | Configured image only; read-only workspace; dropped capabilities; `no-new-privileges`; 256 PID cap; approved rootless network egress; per-agent CPU/memory/timeout controls |
 | **Health checks** | Podman socket reachability + image existence check |
 | **Cancel runs** | Active runs are durably cancelled via `POST /api/runs/{id}?action=cancel`; late completion cannot replace `cancelled` |
 | **Configuration** | `.env`, process environment, and explicit `--db` / `--port` overrides; database path, image, socket path, API timeout, and container timeout are applied |
@@ -145,8 +160,7 @@ form `{"error":"validation_error","field":"...","message":"..."}`.
 | **Integration tests** | `tests/` exists; no tests written yet (require Podman socket) |
 | **Docker compatibility** | Image `localhost/horizon-sandbox:latest` must be built/pulled separately |
 | **Volume mounts beyond /workspace** | Only `/workspace:ro,Z` mount is configured; no additional host paths |
-| **Resource limits** | CPU/memory limits configurable but not enforced in current sandbox |
-| **Network access inside container** | `slirp4netns` provides user-mode NAT egress, which Google model calls require; Horizon does not yet enforce `network_access` or outbound-destination restrictions |
+| **Outbound destination controls** | Approved network egress is not yet restricted to specific destinations |
 | **Secret management** | `GOOGLE_API_KEY` passed as env var; no secret vault integration |
 | **CLI** | No CLI binary built yet (only HTTP API; `horizond` and `horizond.exe` binaries exist from prior build) |
 
