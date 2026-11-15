@@ -43,10 +43,10 @@ horizon/
 │   ├── config/                     # Application configuration
 │   │   └── config.go               # Config struct with ServerConfig, DatabaseConfig, PodmanConfig, AgentConfig + DefaultConfig()
 │   └── api/                        # HTTP API layer
-│       ├── api.go                  # APIHandler interface + ServerConfig
-│       └── handler.go              # Handler struct with full CRUD for agents/runs, async executeRun, health check
+│       └── handler.go              # Handler composition, agent/run HTTP routes, health check
 ├── web/                            # Empty — Future web UI (Angular/Tailwind)
-├── tests/                          # Empty — Integration tests (require Podman socket)
+├── tests/
+│   └── integration/                 # Opt-in tagged real Podman/cagent smoke test
 ├── runtime/
 │   └── Containerfile               # Multi-stage build: cagent binary + minimal Alpine runtime
 ├── go.mod                          # Module: github.com/jain-aadi/horizon, Go 1.26.0
@@ -184,7 +184,7 @@ bounds every materialized agent run through its execution context.
 **Core types**:
 - `EngineConfig` — `SocketPath`, `ImageName`, `APIVersion`, `RequestTimeout`, `ContainerTimeout`
 - `Engine` — wraps `config` + `*http.Client` with Unix socket dialer
-- `RunOptions` — `WorkspaceDir`, `YAMLFile`, `Prompt`, `APIKey`, `OutputWriter`, `Env`, `OnContainerCreated`
+- `RunOptions` — `WorkspaceDir`, `YAMLFile`, `Prompt`, `APIKey`, `OutputWriter`, typed `ExecutionConfig`, `OnContainerCreated`
 - `RunResult` — `ContainerID`, `ExitCode`, `Error`
 - `createReq` / `hostConfig` / `createResp` / `waitResp` — Podman API DTOs
 
@@ -201,12 +201,13 @@ bounds every materialized agent run through its execution context.
 | `RemoveContainer(containerID)` | DELETE `/containers/{id}?force=true` with 10s timeout |
 | `demuxStream(r, out)` | Strips 8-byte Docker/Podman multiplexed header (stream type + frame size) |
 
-**Error handling improvements**:
-- `ContainerTimeout` context on `wait` call — returns timeout error instead of hanging
-- `defer` cleanup with 10s timeout context — verifies removal response
-- Structured error messages with context (`fmt.Errorf("...: %w", err)`)
-- Distinguishes `context.DeadlineExceeded` from other wait errors
-- `LogConfig: {Type: "json-file"}` in host config for structured container logs
+**Execution-policy and error handling**:
+- Resolves only the configured image, explicit approved network access, saved CPU/memory limits, and an agent timeout no greater than the global container timeout
+- Uses one execution deadline for concurrent follow-logs and long-poll wait requests; successful waits still drain final log frames
+- Uses a separate no-overall-timeout client for the long-lived log and wait calls while create, start, and removal retain request timeouts
+- Creates a read-only `/workspace` bind with `UsernsMode=host` so rootless runtime UID 0 maps to the invoking host user, drops all capabilities, sets `no-new-privileges`, caps the container at 256 PIDs, injects only the daemon-owned Google credential, and rejects a Podman service whose `/libpod/info` does not report rootless operation
+- Validates create/start/log/wait/remove response codes; diagnostics are bounded and redact credential values before errors are persisted or logged
+- Defers forced cleanup and logs cleanup success/failure without replacing the primary run outcome
 
 ---
 
@@ -272,8 +273,9 @@ type ScheduleConfig struct {
 
 **Validation and defaults:** `ApplyDefaults()` trims user-facing fields, normalizes
 the model provider, and supplies the configured runtime image when omitted.
-`Validate()` requires a name, goal, instructions, a whitespace-free runtime image,
-and the initial supported cagent model contract: provider `google` plus a model name.
+`Validate()` requires a name, goal, instructions, whitespace-free runtime image, Google
+provider/model, and explicit Google-network approval. It validates optional positive
+container timeout, decimal CPU, and supported integer memory limits before persistence.
 Validation errors identify a stable field name and message for HTTP clients.
 
 ---
@@ -615,8 +617,8 @@ FROM alpine:3.21
 RUN apk add --no-cache ca-certificates curl jq bash python3
 COPY --from=builder /docker-agent /usr/local/bin/docker-agent
 RUN chmod +x /usr/local/bin/docker-agent
-RUN adduser -D -u 1000 agentuser
-USER agentuser
+# Root maps to the invoking host user in the rootless user namespace, allowing
+# access to Horizon's restrictive per-run workspace; Podman drops capabilities.
 WORKDIR /workspace
 ENTRYPOINT ["docker-agent"]
 ```
@@ -624,7 +626,7 @@ ENTRYPOINT ["docker-agent"]
 **Notes**:
 - Builds Docker Agent v1.158.0 and fails the image build unless the checkout is commit `7f94f376a5d10320591d959b351ca1eeb07c959a`
 - Installs `python3`, `curl`, `jq`, `bash` — relatively heavy
-- Runs as non-root `agentuser` (UID 1000)
+- Runs as root only inside the rootless user namespace so it maps to the invoking host user and can read the `0700` run directory / `0600` YAML; Podman still drops all capabilities and sets `no-new-privileges`
 - Entrypoint is `docker-agent`; Podman supplies `run --exec --last /workspace/<agent.yaml> <prompt>`
 - Build with: `podman build -t localhost/horizon-sandbox:latest ./runtime`
 
@@ -640,13 +642,17 @@ ENTRYPOINT ["docker-agent"]
 | Capture output, errors, exit status | ✅ Bounded `output.log`, `RunResult`, and durable `RunRecord` fields |
 | Handle timeouts and cancellation | ✅ Agent timeout context, cancellation registry, known-container removal request, and terminal-state protection |
 | Health checks | ✅ `Engine.HealthCheck()` — socket + image |
-| SQLite persistence | ✅ Agents, runs, schedules with migrations |
+| SQLite persistence | ✅ Agent definitions and run records with migrations |
 | Structured run records | ✅ Status enum, timestamps, exit code, output ref, container ID |
-| Integration tests | ⏳ Directory exists, tests pending |
+| HTTP end-to-end tests | ✅ `httptest` + temporary SQLite + controlled fake engine covers CRUD, success/output, failures, nonzero exits, timeout, cancellation, malformed input, and missing resources |
+| Tagged real-runtime smoke test | ✅ `tests/integration/runtime_smoke_test.go`, opt-in only because it starts Podman and calls the configured provider |
 | Retries/backoff | ❌ Not implemented |
 | Structured logging | ❌ Stdlib `log` only |
 
-**Exit condition**: "Horizon can execute a supported agent task and reliably report its outcome" — **Achieved** for manual runs via HTTP API.
+**Execution-foundation result**: manual-run lifecycle behavior is verified through the
+HTTP suite with temporary SQLite and a controlled fake runtime. Real Podman/cagent/model
+execution is additionally covered by an opt-in smoke test; it is intentionally not part
+of the default suite because it requires a socket, image, credential, and provider use.
 
 ---
 
@@ -670,11 +676,11 @@ curl http://127.0.0.1:8080/api/health
 
 ## Remaining Work for Phase 1 Completion
 
-1. **Integration tests** in `tests/` with `//go:build integration` tag
-2. **Retry logic** in `podman.go` for transient failures (exponential backoff)
-3. **Structured logging** — migrate to `log/slog` with JSON output
-4. **Workspace/YAML generation** — `executeRun` TODOs: proper workspace, agent YAML from definition
-5. **API key management** — secure storage instead of passing via `RunOptions`
+1. **Retry logic** in `podman.go` for transient failures (exponential backoff)
+2. **Structured logging** — migrate to `log/slog` with JSON output
+3. **Scheduler and pause/resume semantics** — currently deferred; agent definitions may carry a schedule shape but no scheduler executes it
+4. **API key management** — secure storage instead of passing the daemon-owned provider credential into the runtime
+5. **Broader egress controls and integrations** — approved network access is not destination-scoped and non-Google providers are unsupported
 
 ---
 

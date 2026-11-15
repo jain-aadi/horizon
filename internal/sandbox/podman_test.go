@@ -34,8 +34,9 @@ func testEngine(handler roundTripperFunc) *Engine {
 			RequestTimeout:   time.Second,
 			ContainerTimeout: time.Minute,
 		},
-		httpClient:   &http.Client{Transport: handler},
-		streamClient: &http.Client{Transport: handler},
+		httpClient:       &http.Client{Transport: handler},
+		streamClient:     &http.Client{Transport: handler},
+		rootlessVerified: true,
 	}
 }
 
@@ -68,6 +69,32 @@ func TestBuildCmdUsesContainerRelativePOSIXPath(t *testing.T) {
 		if command[i] != want[i] {
 			t.Fatalf("buildCmd()[%d] = %q, want %q; full command %#v", i, command[i], want[i], command)
 		}
+	}
+}
+
+func TestEnsureRootlessRejectsRootfulPodman(t *testing.T) {
+	engine := testEngine(func(request *http.Request) (*http.Response, error) {
+		if request.Method == http.MethodGet && strings.HasSuffix(request.URL.Path, "/libpod/info") {
+			return response(request, http.StatusOK, `{"host":{"security":{"rootless":false}}}`), nil
+		}
+		t.Fatalf("unexpected Podman request: %s %s", request.Method, request.URL.Path)
+		return nil, nil
+	})
+
+	if err := engine.ensureRootless(context.Background()); err == nil {
+		t.Fatal("ensureRootless() error = nil, want rootful Podman rejection")
+	}
+}
+
+func TestRunAgentRejectsUnverifiedPodman(t *testing.T) {
+	engine := testEngine(func(request *http.Request) (*http.Response, error) {
+		t.Fatal("RunAgent() contacted Podman before rootless verification")
+		return nil, nil
+	})
+	engine.rootlessVerified = false
+
+	if _, err := engine.RunAgent(context.Background(), testRunOptions()); err == nil {
+		t.Fatal("RunAgent() error = nil, want rootless verification failure")
 	}
 }
 
@@ -132,6 +159,9 @@ func TestRunAgentBuildsLeastPrivilegeCreateRequest(t *testing.T) {
 	}
 	if got := created.HostConfig.SecurityOpt; len(got) != 1 || got[0] != "no-new-privileges" {
 		t.Errorf("SecurityOpt = %#v, want [no-new-privileges]", got)
+	}
+	if created.HostConfig.UsernsMode != "host" {
+		t.Errorf("UsernsMode = %q, want host to preserve rootless host-user mapping", created.HostConfig.UsernsMode)
 	}
 }
 

@@ -46,9 +46,18 @@ func DefaultEngineConfig() EngineConfig {
 }
 
 type Engine struct {
-	config       EngineConfig
-	httpClient   *http.Client
-	streamClient *http.Client
+	config           EngineConfig
+	httpClient       *http.Client
+	streamClient     *http.Client
+	rootlessVerified bool
+}
+
+type podmanInfo struct {
+	Host struct {
+		Security struct {
+			Rootless bool `json:"rootless"`
+		} `json:"security"`
+	} `json:"host"`
 }
 
 type createReq struct {
@@ -68,6 +77,7 @@ type hostConfig struct {
 	Memory      int64     `json:"Memory,omitempty"`
 	PidsLimit   int64     `json:"PidsLimit,omitempty"`
 	SecurityOpt []string  `json:"SecurityOpt,omitempty"`
+	UsernsMode  string    `json:"UsernsMode,omitempty"`
 	LogConfig   logConfig `json:"LogConfig,omitempty"`
 }
 
@@ -97,16 +107,53 @@ func NewEngine(config EngineConfig) (*Engine, error) {
 	client := &http.Client{Timeout: config.RequestTimeout, Transport: transport}
 	streamClient := &http.Client{Transport: transport}
 
-	return &Engine{
+	engine := &Engine{
 		config:       config,
 		httpClient:   client,
 		streamClient: streamClient,
-	}, nil
+	}
+	verificationTimeout := config.RequestTimeout
+	if verificationTimeout <= 0 {
+		verificationTimeout = 30 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), verificationTimeout)
+	defer cancel()
+	if err := engine.ensureRootless(ctx); err != nil {
+		return nil, err
+	}
+	engine.rootlessVerified = true
+	return engine, nil
 }
 
 // NewDefaultEngine creates an engine with default configuration.
 func NewDefaultEngine() (*Engine, error) {
 	return NewEngine(DefaultEngineConfig())
+}
+
+// ensureRootless rejects a rootful Podman service before Horizon can execute a
+// container with access to a private host workspace.
+func (e *Engine) ensureRootless(ctx context.Context) error {
+	infoURL := fmt.Sprintf("http://d/%s/libpod/info", e.config.APIVersion)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, infoURL, nil)
+	if err != nil {
+		return fmt.Errorf("create Podman info request: %w", err)
+	}
+	resp, err := e.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("inspect Podman rootless mode: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("inspect Podman rootless mode failed (%d): %s", resp.StatusCode, readDiagnostic(resp.Body))
+	}
+	var info podmanInfo
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		return fmt.Errorf("decode Podman rootless mode: %w", err)
+	}
+	if !info.Host.Security.Rootless {
+		return errors.New("Podman service must be rootless")
+	}
+	return nil
 }
 
 // demuxStream strips the 8-byte Docker/Podman multiplexed stream header.
@@ -162,6 +209,9 @@ type RunResult struct {
 // Output is streamed to out in real time. On any failure, output is captured
 // and included in the returned error.
 func (e *Engine) RunAgent(ctx context.Context, opts RunOptions) (*RunResult, error) {
+	if !e.rootlessVerified {
+		return nil, errors.New("Podman service has not been verified as rootless")
+	}
 	execution, err := e.resolveExecution(opts.Execution)
 	if err != nil {
 		return nil, err
@@ -191,6 +241,7 @@ func (e *Engine) RunAgent(ctx context.Context, opts RunOptions) (*RunResult, err
 			Memory:      execution.memoryBytes,
 			PidsLimit:   256,
 			SecurityOpt: []string{"no-new-privileges"},
+			UsernsMode:  "host",
 			LogConfig:   logConfig{Type: "json-file"},
 		},
 	}

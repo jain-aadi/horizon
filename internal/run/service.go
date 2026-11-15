@@ -328,6 +328,9 @@ func (s *Service) CancelRun(_ context.Context, runID string, reason string) erro
 	active, ok := s.active[runID]
 	if !ok || active.cancelled {
 		s.mu.Unlock()
+		if _, err := s.runs.GetByID(persistCtx, runID); err != nil {
+			return err
+		}
 		return ErrRunNotCancellable
 	}
 

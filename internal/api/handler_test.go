@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -38,7 +39,29 @@ func (e immediateEngine) RunAgent(_ context.Context, opts sandbox.RunOptions) (*
 
 func (immediateEngine) RemoveContainer(string) error { return nil }
 
+type scriptedEngine struct {
+	runFn   func(context.Context, sandbox.RunOptions) (*sandbox.RunResult, error)
+	removed chan string
+}
+
+func (e *scriptedEngine) HealthCheck(context.Context) error { return nil }
+
+func (e *scriptedEngine) RunAgent(ctx context.Context, opts sandbox.RunOptions) (*sandbox.RunResult, error) {
+	return e.runFn(ctx, opts)
+}
+
+func (e *scriptedEngine) RemoveContainer(containerID string) error {
+	if e.removed != nil {
+		e.removed <- containerID
+	}
+	return nil
+}
+
 func newTestServer(t *testing.T) *httptest.Server {
+	return newTestServerWithEngine(t, immediateEngine{t: t}, time.Second)
+}
+
+func newTestServerWithEngine(t *testing.T, engine Engine, defaultTimeout time.Duration) *httptest.Server {
 	t.Helper()
 
 	db, err := storage.NewDB(filepath.Join(t.TempDir(), "horizon.db"))
@@ -50,8 +73,8 @@ func newTestServer(t *testing.T) *httptest.Server {
 	handler := NewHandler(
 		storage.NewAgentRepository(db),
 		storage.NewRunRepository(db),
-		immediateEngine{t: t},
-		&Config{DefaultImage: handlerTestDefaultImage, DataDir: t.TempDir(), DefaultTimeout: time.Second},
+		engine,
+		&Config{DefaultImage: handlerTestDefaultImage, DataDir: t.TempDir(), DefaultTimeout: defaultTimeout},
 	)
 	mux := http.NewServeMux()
 	handler.RegisterRoutes(mux)
@@ -270,5 +293,237 @@ func TestCreateRunMaterializesAndServesOutput(t *testing.T) {
 	}
 	if string(output) != "api test output" {
 		t.Errorf("output = %q, want %q", output, "api test output")
+	}
+}
+
+func createHTTPTestAgent(t *testing.T, serverURL string) agent.AgentDefinition {
+	t.Helper()
+	response, err := http.Post(serverURL+"/api/agents", "application/json", strings.NewReader(`{"name":"HTTP test agent","goal":"Exercise the HTTP lifecycle.","instructions":"Return a concise result.","model_config":{"provider":"google","model":"gemini-3.5-flash-lite"},"permissions":{"network_access":true}}`))
+	if err != nil {
+		t.Fatalf("POST /api/agents error = %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("POST /api/agents status = %d, want %d", response.StatusCode, http.StatusCreated)
+	}
+	var definition agent.AgentDefinition
+	if err := json.NewDecoder(response.Body).Decode(&definition); err != nil {
+		t.Fatalf("decode created agent: %v", err)
+	}
+	return definition
+}
+
+func startHTTPTestRun(t *testing.T, serverURL, agentID string) run.RunRecord {
+	t.Helper()
+	response, err := http.Post(serverURL+"/api/runs", "application/json", strings.NewReader(`{"agent_id":"`+agentID+`","prompt":"Run the HTTP test"}`))
+	if err != nil {
+		t.Fatalf("POST /api/runs error = %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusAccepted {
+		t.Fatalf("POST /api/runs status = %d, want %d", response.StatusCode, http.StatusAccepted)
+	}
+	var record run.RunRecord
+	if err := json.NewDecoder(response.Body).Decode(&record); err != nil {
+		t.Fatalf("decode created run: %v", err)
+	}
+	return record
+}
+
+func waitForHTTPRun(t *testing.T, serverURL, runID string) run.RunRecord {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		response, err := http.Get(serverURL + "/api/runs/" + runID)
+		if err != nil {
+			t.Fatalf("GET /api/runs/{id} error = %v", err)
+		}
+		var record run.RunRecord
+		decodeErr := json.NewDecoder(response.Body).Decode(&record)
+		response.Body.Close()
+		if decodeErr != nil {
+			t.Fatalf("decode run response: %v", decodeErr)
+		}
+		if run.IsTerminalStatus(record.Status) {
+			return record
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("run %s did not reach a terminal state", runID)
+	return run.RunRecord{}
+}
+
+func TestAgentHTTPRetrievalListingAndDeletion(t *testing.T) {
+	server := newTestServer(t)
+	defer server.Close()
+	created := createHTTPTestAgent(t, server.URL)
+
+	getResponse, err := http.Get(server.URL + "/api/agents/" + created.ID)
+	if err != nil {
+		t.Fatalf("GET /api/agents/{id} error = %v", err)
+	}
+	defer getResponse.Body.Close()
+	if getResponse.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/agents/{id} status = %d, want %d", getResponse.StatusCode, http.StatusOK)
+	}
+	var fetched agent.AgentDefinition
+	if err := json.NewDecoder(getResponse.Body).Decode(&fetched); err != nil {
+		t.Fatalf("decode fetched agent: %v", err)
+	}
+	if fetched.ID != created.ID || fetched.Version != created.Version {
+		t.Errorf("fetched agent = %#v, want created identity and version", fetched)
+	}
+
+	listResponse, err := http.Get(server.URL + "/api/agents")
+	if err != nil {
+		t.Fatalf("GET /api/agents error = %v", err)
+	}
+	defer listResponse.Body.Close()
+	var definitions []agent.AgentDefinition
+	if err := json.NewDecoder(listResponse.Body).Decode(&definitions); err != nil {
+		t.Fatalf("decode listed agents: %v", err)
+	}
+	if len(definitions) != 1 || definitions[0].ID != created.ID {
+		t.Errorf("listed agents = %#v, want one created agent", definitions)
+	}
+
+	deleteRequest, err := http.NewRequest(http.MethodDelete, server.URL+"/api/agents/"+created.ID, nil)
+	if err != nil {
+		t.Fatalf("NewRequest(DELETE) error = %v", err)
+	}
+	deleteResponse, err := http.DefaultClient.Do(deleteRequest)
+	if err != nil {
+		t.Fatalf("DELETE /api/agents/{id} error = %v", err)
+	}
+	deleteResponse.Body.Close()
+	if deleteResponse.StatusCode != http.StatusNoContent {
+		t.Fatalf("DELETE /api/agents/{id} status = %d, want %d", deleteResponse.StatusCode, http.StatusNoContent)
+	}
+
+	missingResponse, err := http.Get(server.URL + "/api/agents/" + created.ID)
+	if err != nil {
+		t.Fatalf("GET deleted agent error = %v", err)
+	}
+	missingResponse.Body.Close()
+	if missingResponse.StatusCode != http.StatusNotFound {
+		t.Errorf("GET deleted agent status = %d, want %d", missingResponse.StatusCode, http.StatusNotFound)
+	}
+}
+
+func TestHTTPRejectsMalformedAndUnknownResources(t *testing.T) {
+	server := newTestServer(t)
+	defer server.Close()
+	tests := []struct {
+		name, method, path, body string
+		want                     int
+	}{
+		{name: "malformed agent", method: http.MethodPost, path: "/api/agents", body: `{`, want: http.StatusBadRequest},
+		{name: "invalid agent", method: http.MethodPost, path: "/api/agents", body: `{"name":"missing required fields"}`, want: http.StatusBadRequest},
+		{name: "malformed run", method: http.MethodPost, path: "/api/runs", body: `{`, want: http.StatusBadRequest},
+		{name: "missing run agent", method: http.MethodPost, path: "/api/runs", body: `{"prompt":"missing agent"}`, want: http.StatusBadRequest},
+		{name: "unknown run agent", method: http.MethodPost, path: "/api/runs", body: `{"agent_id":"does-not-exist","prompt":"missing agent"}`, want: http.StatusNotFound},
+		{name: "unknown run", method: http.MethodGet, path: "/api/runs/does-not-exist", want: http.StatusNotFound},
+		{name: "unknown run output", method: http.MethodGet, path: "/api/runs/does-not-exist/output", want: http.StatusNotFound},
+		{name: "unknown run cancellation", method: http.MethodPost, path: "/api/runs/does-not-exist?action=cancel", body: `{}`, want: http.StatusNotFound},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			request, err := http.NewRequest(tt.method, server.URL+tt.path, strings.NewReader(tt.body))
+			if err != nil {
+				t.Fatalf("NewRequest() error = %v", err)
+			}
+			if tt.body != "" {
+				request.Header.Set("Content-Type", "application/json")
+			}
+			response, err := http.DefaultClient.Do(request)
+			if err != nil {
+				t.Fatalf("HTTP request error = %v", err)
+			}
+			response.Body.Close()
+			if response.StatusCode != tt.want {
+				t.Errorf("status = %d, want %d", response.StatusCode, tt.want)
+			}
+		})
+	}
+}
+
+func TestHTTPRunFailureNonzeroExitAndTimeout(t *testing.T) {
+	tests := []struct {
+		name    string
+		timeout time.Duration
+		runFn   func(context.Context, sandbox.RunOptions) (*sandbox.RunResult, error)
+		want    run.RunStatus
+	}{
+		{name: "runtime failure", timeout: time.Second, runFn: func(_ context.Context, _ sandbox.RunOptions) (*sandbox.RunResult, error) {
+			return nil, errors.New("container startup failed")
+		}, want: run.RunStatusFailed},
+		{name: "nonzero exit", timeout: time.Second, runFn: func(_ context.Context, _ sandbox.RunOptions) (*sandbox.RunResult, error) {
+			return &sandbox.RunResult{ContainerID: "failed-container", ExitCode: 7}, nil
+		}, want: run.RunStatusFailed},
+		{name: "timeout", timeout: 10 * time.Millisecond, runFn: func(ctx context.Context, _ sandbox.RunOptions) (*sandbox.RunResult, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}, want: run.RunStatusTimedOut},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := newTestServerWithEngine(t, &scriptedEngine{runFn: tt.runFn}, tt.timeout)
+			defer server.Close()
+			definition := createHTTPTestAgent(t, server.URL)
+			created := startHTTPTestRun(t, server.URL, definition.ID)
+			completed := waitForHTTPRun(t, server.URL, created.ID)
+			if completed.Status != tt.want {
+				t.Errorf("completed Status = %q, want %q", completed.Status, tt.want)
+			}
+			if completed.ErrorMessage == "" {
+				t.Error("completed ErrorMessage is empty, want runtime diagnostic")
+			}
+		})
+	}
+}
+
+func TestHTTPCancellationPersistsAndRequestsRemoval(t *testing.T) {
+	started := make(chan struct{})
+	removed := make(chan string, 1)
+	engine := &scriptedEngine{removed: removed, runFn: func(ctx context.Context, opts sandbox.RunOptions) (*sandbox.RunResult, error) {
+		if opts.OnContainerCreated != nil {
+			opts.OnContainerCreated("cancelled-container")
+		}
+		close(started)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}}
+	server := newTestServerWithEngine(t, engine, time.Second)
+	defer server.Close()
+	definition := createHTTPTestAgent(t, server.URL)
+	created := startHTTPTestRun(t, server.URL, definition.ID)
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("runtime did not start")
+	}
+
+	cancelResponse, err := http.Post(server.URL+"/api/runs/"+created.ID+"?action=cancel", "application/json", strings.NewReader(`{"reason":"test cancellation"}`))
+	if err != nil {
+		t.Fatalf("POST cancel error = %v", err)
+	}
+	defer cancelResponse.Body.Close()
+	if cancelResponse.StatusCode != http.StatusOK {
+		t.Fatalf("POST cancel status = %d, want %d", cancelResponse.StatusCode, http.StatusOK)
+	}
+	var cancelled run.RunRecord
+	if err := json.NewDecoder(cancelResponse.Body).Decode(&cancelled); err != nil {
+		t.Fatalf("decode cancellation response: %v", err)
+	}
+	if cancelled.Status != run.RunStatusCancelled || cancelled.CancelReason != "test cancellation" {
+		t.Errorf("cancelled record = %#v", cancelled)
+	}
+	select {
+	case containerID := <-removed:
+		if containerID != "cancelled-container" {
+			t.Errorf("removed container = %q, want cancelled-container", containerID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancellation did not request container removal")
 	}
 }

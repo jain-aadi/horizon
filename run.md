@@ -13,7 +13,7 @@
 
 ## Running the Server
 
-### 1. Quick health check (no image build needed)
+### 1. Health check (requires socket and image)
 
 ```bash
 CGO_ENABLED=0 go run ./cmd/horizond --health-check
@@ -26,7 +26,7 @@ Health check passed
 
 This verifies:
 - Podman socket is reachable
-- The configured sandbox image exists (or will be built on first run)
+- The configured sandbox image already exists
 
 ### 2. Start the HTTP API server
 
@@ -78,7 +78,11 @@ requires an explicit `permissions.network_access: true` approval. At the Podman 
 Horizon allows only the configured image, mounts only `/workspace:ro,Z`, drops all
 capabilities, sets `no-new-privileges`, caps processes at 256, disables host loopback in
 rootless `slirp4netns`, and maps saved CPU/memory limits to the create request. The
-network approval does not yet provide destination-level egress filtering.
+create request explicitly sets `UsernsMode=host`; on the verified rootless Podman service,
+runtime root maps to the invoking host user and can read the protected per-run workspace
+regardless of a `containers.conf` user-namespace default. Horizon verifies `/libpod/info`
+during engine construction and rejects a rootful Podman service. The network approval does
+not yet provide destination-level egress filtering.
 
 A saved container timeout can shorten but never exceed `HORIZON_CONTAINER_TIMEOUT`.
 The engine rejects different images, oversized timeouts, malformed resource limits, and
@@ -138,7 +142,7 @@ the form `{"error":"validation_error","field":"...","message":"..."}`.
 |---|---|
 | **Agent lifecycle** | Create, list, get, update, delete agents via HTTP API |
 | **Run execution** | Manual trigger materializes a saved definition into a per-run Docker Agent YAML workspace, then executes it in Podman |
-| **Persistence** | SQLite stores agent definitions, run history, schedules across restarts |
+| **Persistence** | SQLite stores agent definitions and run history across restarts |
 | **Run status** | `queued` → `running` → `succeeded`/`failed`/`cancelled`/`timed_out` |
 | **Container management** | Auto-create, start, stream bounded output, wait for exit, request removal on cancellation, and clean up containers after every completed run |
 | **Runtime policy** | Configured image only; read-only workspace; dropped capabilities; `no-new-privileges`; 256 PID cap; approved rootless network egress; per-agent CPU/memory/timeout controls |
@@ -146,6 +150,7 @@ the form `{"error":"validation_error","field":"...","message":"..."}`.
 | **Cancel runs** | Active runs are durably cancelled via `POST /api/runs/{id}?action=cancel`; late completion cannot replace `cancelled` |
 | **Configuration** | `.env`, process environment, and explicit `--db` / `--port` overrides; database path, image, socket path, API timeout, and container timeout are applied |
 | **HTTP API** | RESTful endpoints: `/api/agents`, `/api/runs`, `/api/health` |
+| **Verification** | Deterministic HTTP lifecycle tests use SQLite and a fake runtime; `tests/integration/runtime_smoke_test.go` is an explicit opt-in real Podman/cagent/provider smoke test |
 
 ### ❌ Not Yet Covered (Phase 2+)
 
@@ -157,7 +162,6 @@ the form `{"error":"validation_error","field":"...","message":"..."}`.
 | **Advanced permissions** | Basic permission set only; fine-grained control not implemented |
 | **Multiple model providers** | Currently only Google Gemini via `GOOGLE_API_KEY` |
 | **Web UI** | `web/` directory exists; UI not yet built |
-| **Integration tests** | `tests/` exists; no tests written yet (require Podman socket) |
 | **Docker compatibility** | Image `localhost/horizon-sandbox:latest` must be built/pulled separately |
 | **Volume mounts beyond /workspace** | Only `/workspace:ro,Z` mount is configured; no additional host paths |
 | **Outbound destination controls** | Approved network egress is not yet restricted to specific destinations |
@@ -180,25 +184,33 @@ Or with Podman:
 podman build -t localhost/horizon-sandbox:latest ./runtime
 ```
 
-**Note:** The image contains `cagent` (Docker Agent) and minimal runtime tools. It is **not** built automatically — the `Containerfile` is provided for reference and future use. The server can run without the image if only health-check mode is used, but agent execution will fail until the image is available.
+**Note:** The image contains `cagent` (Docker Agent) and minimal runtime tools. It is **not** built automatically — build it before health checks or agent execution. The server itself can start without the image, but its health check and any agent run require it.
 
 ---
 
-## Running Integration Tests (If Podman is Available)
+## Running the Opt-in Real Runtime Smoke Test
+
+The deterministic unit suite uses SQLite plus fake runtime engines and needs no Podman,
+network access, or provider credential:
 
 ```bash
-# Ensure Podman socket and image are available
-podman system connection list
-podman images | grep horizon-sandbox
-
-# Run tests with build tag
-CGO_ENABLED=0 go test ./... -tags integration -count=1
+CGO_ENABLED=0 go test ./... -count=1
 ```
 
-Tests require:
-- Podman socket reachable at default path
-- `localhost/horizon-sandbox:latest` image available
-- `GOOGLE_API_KEY` set
+The tagged smoke test starts the real Podman container and calls the configured Google
+provider. It is deliberately disabled unless all prerequisites are explicit:
+
+```bash
+HORIZON_RUN_REAL_RUNTIME_TESTS=1 \
+HORIZON_SOCKET="$XDG_RUNTIME_DIR/podman/podman.sock" \
+HORIZON_IMAGE=localhost/horizon-sandbox:latest \
+GOOGLE_API_KEY="$GOOGLE_API_KEY" \
+CGO_ENABLED=0 go test -tags integration ./tests/integration -count=1
+```
+
+It skips when the opt-in flag, socket, or credential is absent. The test verifies the
+Podman health check, per-run YAML mount, Docker Agent execution, and a known smoke-test
+response. It can incur model-provider usage.
 
 ---
 

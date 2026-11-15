@@ -102,8 +102,12 @@ daemon's execution environment, never from HTTP input or generated agent YAML.
 The Podman create request is policy-owned: it permits only the configured image, mounts
 only the per-run workspace read-only, drops all Linux capabilities, sets
 `no-new-privileges`, limits the container to 256 PIDs, and maps saved CPU/memory limits
-to Podman `NanoCpus`/`Memory`. An agent timeout may shorten but never exceed
-`HORIZON_CONTAINER_TIMEOUT`; no caller-supplied environment map reaches the container.
+to Podman `NanoCpus`/`Memory`. The create request explicitly uses `UsernsMode=host`; on
+the verified rootless Podman service, runtime root maps to the invoking host user and can
+read the protected run workspace regardless of a `containers.conf` user-namespace default.
+Horizon verifies `/libpod/info` at engine construction and rejects a rootful Podman
+service. An agent timeout may shorten but never exceed `HORIZON_CONTAINER_TIMEOUT`; no
+caller-supplied environment map reaches the container.
 
 Run logs are captured to a bounded local `output.log` in that workspace. The database
 stores only a safe relative output reference; retrieve it through
@@ -169,24 +173,33 @@ horizon/
 
 - ✅ Agent lifecycle: create, list, get, update, delete via HTTP API
 - ✅ Run execution: saved definitions materialize to isolated per-run Docker Agent YAML workspaces
-- ✅ Persistence: SQLite stores agents, run history, schedules across restarts
+- ✅ Persistence: SQLite stores agent definitions and run history across restarts
 - ✅ Run status: `queued` → `running` → `succeeded`/`failed`/`cancelled`/`timed_out`
 - ✅ Container management: auto-create, start, stream logs, wait, auto-remove
 - ✅ Health checks: Podman socket reachability + image existence
 - ✅ Output and cancellation: bounded local output endpoint and active-run cancellation with terminal-state protection
 
-## Development
+## Verification
 
 ```bash
-# Build
+# Deterministic unit and HTTP lifecycle tests: SQLite + fake runtime only.
+CGO_ENABLED=0 go test ./... -count=1
+CGO_ENABLED=0 go vet ./...
 CGO_ENABLED=0 go build ./...
 
-# Lint
-CGO_ENABLED=0 go vet ./...
-
-# Run tests (require Podman socket + image + GOOGLE_API_KEY)
-CGO_ENABLED=0 go test ./... -tags integration -count=1
+# Opt-in real Podman + Docker Agent + Google-provider smoke test.
+# This can use the configured provider credential and therefore is not run by default.
+HORIZON_RUN_REAL_RUNTIME_TESTS=1 \
+HORIZON_SOCKET="$XDG_RUNTIME_DIR/podman/podman.sock" \
+HORIZON_IMAGE=localhost/horizon-sandbox:latest \
+CGO_ENABLED=0 go test -tags integration ./tests/integration -count=1
 ```
+
+The regular suite covers HTTP agent CRUD, queued-run creation, output retrieval,
+container failure, nonzero exits, timeout, cancellation, malformed input, and missing
+resources without requiring Podman, cagent, network access, or a model API key. The
+tagged smoke test is skipped unless its explicit opt-in plus socket and credential are
+present; it performs a real container and provider call.
 
 ## Documentation
 
