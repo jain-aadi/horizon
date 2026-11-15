@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"time"
@@ -18,10 +20,11 @@ import (
 
 // Handler implements the HTTP API.
 type Handler struct {
-	agentRepo *storage.AgentRepository
-	runRepo   *storage.RunRepository
-	engine    *sandbox.Engine
-	config    *Config
+	agentService *agent.Service
+	agentRepo    *storage.AgentRepository
+	runRepo      *storage.RunRepository
+	engine       *sandbox.Engine
+	config       *Config
 }
 
 // Config holds handler configuration.
@@ -32,11 +35,17 @@ type Config struct {
 
 // NewHandler creates a new API handler.
 func NewHandler(agentRepo *storage.AgentRepository, runRepo *storage.RunRepository, engine *sandbox.Engine, cfg *Config) *Handler {
+	defaultImage := ""
+	if cfg != nil {
+		defaultImage = cfg.DefaultImage
+	}
+
 	return &Handler{
-		agentRepo: agentRepo,
-		runRepo:   runRepo,
-		engine:    engine,
-		config:    cfg,
+		agentService: agent.NewService(agentRepo, runRepo, defaultImage),
+		agentRepo:    agentRepo,
+		runRepo:      runRepo,
+		engine:       engine,
+		config:       cfg,
 	}
 }
 
@@ -47,6 +56,37 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/agents/", h.handleAgentByID)
 	mux.HandleFunc("/api/runs", h.handleRuns)
 	mux.HandleFunc("/api/runs/", h.handleRunByID)
+}
+
+type apiErrorResponse struct {
+	Error   string `json:"error"`
+	Field   string `json:"field,omitempty"`
+	Message string `json:"message,omitempty"`
+}
+
+func writeValidationError(w http.ResponseWriter, validationError *agent.ValidationError) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusBadRequest)
+	_ = json.NewEncoder(w).Encode(apiErrorResponse{
+		Error:   "validation_error",
+		Field:   validationError.Field,
+		Message: validationError.Message,
+	})
+}
+
+func writeAgentServiceError(w http.ResponseWriter, err error) {
+	var validationError *agent.ValidationError
+	if errors.As(err, &validationError) {
+		writeValidationError(w, validationError)
+		return
+	}
+	if errors.Is(err, storage.ErrNotFound) {
+		http.Error(w, "Agent not found", http.StatusNotFound)
+		return
+	}
+
+	log.Printf("agent service error: %v", err)
+	http.Error(w, "Internal server error", http.StatusInternalServerError)
 }
 
 func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -92,95 +132,43 @@ func (h *Handler) handleAgentByID(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) listAgents(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	rows, err := h.agentRepo.List(ctx)
+	agents, err := h.agentService.ListAgents(r.Context())
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeAgentServiceError(w, err)
 		return
 	}
-	agents := make([]*agent.AgentDefinition, len(rows))
-	for i, row := range rows {
-		agentDef := &agent.AgentDefinition{
-			ID:           row.ID,
-			Name:         row.Name,
-			Description:  row.Description,
-			Goal:         row.Goal,
-			Instructions: row.Instructions,
-			CreatedAt:    row.CreatedAt,
-			UpdatedAt:    row.UpdatedAt,
-			Version:      row.Version,
-		}
-		json.Unmarshal(row.RuntimeConfig, &agentDef.RuntimeConfig)
-		json.Unmarshal(row.ModelConfig, &agentDef.ModelConfig)
-		json.Unmarshal(row.Capabilities, &agentDef.Capabilities)
-		json.Unmarshal(row.Permissions, &agentDef.Permissions)
-		if len(row.Schedule) > 0 && string(row.Schedule) != "null" {
-			var sched agent.ScheduleConfig
-			json.Unmarshal(row.Schedule, &sched)
-			agentDef.Schedule = &sched
-		}
-		agents[i] = agentDef
-	}
+	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(agents)
 }
 
 func (h *Handler) createAgent(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
 	var req agent.AgentDefinition
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
 
-	if req.ID == "" {
-		req.ID = uuid.New().String()
-	}
-
-	row := req.ToStorageRow()
-	if err := h.agentRepo.Save(ctx, row); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	if err := h.agentService.CreateAgent(r.Context(), &req); err != nil {
+		writeAgentServiceError(w, err)
 		return
 	}
 
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(req)
 }
 
 func (h *Handler) getAgent(w http.ResponseWriter, r *http.Request, id string) {
-	ctx := r.Context()
-	row, err := h.agentRepo.GetByID(ctx, id)
+	agentDef, err := h.agentService.GetAgent(r.Context(), id)
 	if err != nil {
-		if err == storage.ErrNotFound {
-			http.Error(w, "Agent not found", http.StatusNotFound)
-			return
-		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeAgentServiceError(w, err)
 		return
 	}
-	agentDef := &agent.AgentDefinition{
-		ID:           row.ID,
-		Name:         row.Name,
-		Description:  row.Description,
-		Goal:         row.Goal,
-		Instructions: row.Instructions,
-		CreatedAt:    row.CreatedAt,
-		UpdatedAt:    row.UpdatedAt,
-		Version:      row.Version,
-	}
-	json.Unmarshal(row.RuntimeConfig, &agentDef.RuntimeConfig)
-	json.Unmarshal(row.ModelConfig, &agentDef.ModelConfig)
-	json.Unmarshal(row.Capabilities, &agentDef.Capabilities)
-	json.Unmarshal(row.Permissions, &agentDef.Permissions)
-	if len(row.Schedule) > 0 && string(row.Schedule) != "null" {
-		var sched agent.ScheduleConfig
-		json.Unmarshal(row.Schedule, &sched)
-		agentDef.Schedule = &sched
-	}
+	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(agentDef)
 }
 
 func (h *Handler) updateAgent(w http.ResponseWriter, r *http.Request, id string) {
-	ctx := r.Context()
 	var req agent.AgentDefinition
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
@@ -188,36 +176,17 @@ func (h *Handler) updateAgent(w http.ResponseWriter, r *http.Request, id string)
 	}
 	req.ID = id
 
-	existingRow, err := h.agentRepo.GetByID(ctx, id)
-	if err != nil {
-		if err == storage.ErrNotFound {
-			http.Error(w, "Agent not found", http.StatusNotFound)
-			return
-		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	if err := h.agentService.UpdateAgent(r.Context(), &req); err != nil {
+		writeAgentServiceError(w, err)
 		return
 	}
-
-	req.CreatedAt = existingRow.CreatedAt
-	req.UpdatedAt = time.Now()
-	req.Version = existingRow.Version + 1
-
-	row := req.ToStorageRow()
-	if err := h.agentRepo.Save(ctx, row); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
+	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(req)
 }
 
 func (h *Handler) deleteAgent(w http.ResponseWriter, r *http.Request, id string) {
-	ctx := r.Context()
-	if err := h.agentRepo.Delete(ctx, id); err != nil {
-		if err == storage.ErrNotFound {
-			http.Error(w, "Agent not found", http.StatusNotFound)
-			return
-		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	if err := h.agentService.DeleteAgent(r.Context(), id); err != nil {
+		writeAgentServiceError(w, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -463,7 +432,7 @@ func (h *Handler) executeRun(ctx context.Context, runRecord *storage.RunRow, age
 		WorkspaceDir: ".",          // TODO: Use proper workspace from agent config
 		YAMLFile:     "agent.yaml", // TODO: Generate from agent definition
 		Prompt:       prompt,
-		OutputWriter: io.Discard,   // discard output for now
+		OutputWriter: io.Discard, // discard output for now
 		Env:          env,
 		APIKey:       os.Getenv("GOOGLE_API_KEY"),
 	}

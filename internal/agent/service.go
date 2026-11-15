@@ -6,35 +6,42 @@ import (
 	"errors"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/horizon/horizon/internal/run"
 	"github.com/horizon/horizon/internal/storage"
 )
 
 var (
-	ErrAgentNotFound = errors.New("agent not found")
-	ErrInvalidAgent  = errors.New("invalid agent definition")
+	ErrInvalidAgent = errors.New("invalid agent definition")
 )
 
 // Service handles agent lifecycle operations.
 type Service struct {
-	repo    *storage.AgentRepository
-	runRepo *storage.RunRepository
+	repo         *storage.AgentRepository
+	runRepo      *storage.RunRepository
+	defaultImage string
 }
 
 // NewService creates a new agent service.
-func NewService(repo *storage.AgentRepository, runRepo *storage.RunRepository) *Service {
-	return &Service{repo: repo, runRepo: runRepo}
+func NewService(repo *storage.AgentRepository, runRepo *storage.RunRepository, defaultImage string) *Service {
+	return &Service{repo: repo, runRepo: runRepo, defaultImage: defaultImage}
 }
 
 // CreateAgent saves a new agent definition.
 func (s *Service) CreateAgent(ctx context.Context, def *AgentDefinition) error {
-	if def.ID == "" {
-		return ErrInvalidAgent
+	if err := s.prepareDefinition(def); err != nil {
+		return err
 	}
-	def.CreatedAt = time.Now()
-	def.UpdatedAt = time.Now()
+
+	def.ID = uuid.NewString()
+	now := time.Now().UTC()
+	def.CreatedAt = now
+	def.UpdatedAt = now
 	def.Version = 1
-	row := def.toStorageRow()
+	row, err := def.ToStorageRow()
+	if err != nil {
+		return err
+	}
 	return s.repo.Save(ctx, row)
 }
 
@@ -62,14 +69,24 @@ func (s *Service) ListAgents(ctx context.Context) ([]*AgentDefinition, error) {
 
 // UpdateAgent updates an existing agent definition.
 func (s *Service) UpdateAgent(ctx context.Context, def *AgentDefinition) error {
+	if def == nil || def.ID == "" {
+		return ErrInvalidAgent
+	}
+	if err := s.prepareDefinition(def); err != nil {
+		return err
+	}
+
 	existing, err := s.repo.GetByID(ctx, def.ID)
 	if err != nil {
 		return err
 	}
 	def.CreatedAt = existing.CreatedAt
-	def.UpdatedAt = time.Now()
+	def.UpdatedAt = time.Now().UTC()
 	def.Version = existing.Version + 1
-	row := def.toStorageRow()
+	row, err := def.ToStorageRow()
+	if err != nil {
+		return err
+	}
 	return s.repo.Save(ctx, row)
 }
 
@@ -99,47 +116,25 @@ func (s *Service) GetAgentWithRuns(ctx context.Context, id string) (*AgentDefini
 	return agent, nil
 }
 
-// toStorageRow converts AgentDefinition to storage.AgentRow.
-func (def *AgentDefinition) toStorageRow() *storage.AgentRow {
-	runtimeConfig, _ := json.Marshal(def.RuntimeConfig)
-	modelConfig, _ := json.Marshal(def.ModelConfig)
-	capabilities, _ := json.Marshal(def.Capabilities)
-	permissions, _ := json.Marshal(def.Permissions)
-	var schedule json.RawMessage
-	if def.Schedule != nil {
-		schedule, _ = json.Marshal(def.Schedule)
-	} else {
-		schedule = json.RawMessage("null")
+func (s *Service) prepareDefinition(def *AgentDefinition) error {
+	if def == nil {
+		return ErrInvalidAgent
 	}
-
-	return &storage.AgentRow{
-		ID:            def.ID,
-		Name:          def.Name,
-		Description:   def.Description,
-		Goal:          def.Goal,
-		Instructions:  def.Instructions,
-		RuntimeConfig: runtimeConfig,
-		ModelConfig:   modelConfig,
-		Capabilities:  capabilities,
-		Permissions:   permissions,
-		Schedule:      schedule,
-		CreatedAt:     def.CreatedAt,
-		UpdatedAt:     def.UpdatedAt,
-		Version:       def.Version,
-	}
+	def.ApplyDefaults(s.defaultImage)
+	return def.Validate()
 }
 
 // storageRowToAgent converts storage.AgentRow to AgentDefinition.
 func storageRowToAgent(row *storage.AgentRow) *AgentDefinition {
 	def := &AgentDefinition{
-		ID:            row.ID,
-		Name:          row.Name,
-		Description:   row.Description,
-		Goal:          row.Goal,
-		Instructions:  row.Instructions,
-		CreatedAt:     row.CreatedAt,
-		UpdatedAt:     row.UpdatedAt,
-		Version:       row.Version,
+		ID:           row.ID,
+		Name:         row.Name,
+		Description:  row.Description,
+		Goal:         row.Goal,
+		Instructions: row.Instructions,
+		CreatedAt:    row.CreatedAt,
+		UpdatedAt:    row.UpdatedAt,
+		Version:      row.Version,
 	}
 	json.Unmarshal(row.RuntimeConfig, &def.RuntimeConfig)
 	json.Unmarshal(row.ModelConfig, &def.ModelConfig)

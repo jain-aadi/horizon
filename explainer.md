@@ -267,7 +267,13 @@ type ScheduleConfig struct {
 **`ToStorageRow()`** — converts `AgentDefinition` → `storage.AgentRow`:
 - Marshals `RuntimeConfig`, `ModelConfig`, `Capabilities`, `Permissions` to `json.RawMessage`
 - Marshals `Schedule` to `json.RawMessage` (or `"null"` if nil)
-- Returns `*storage.AgentRow` for persistence
+- Returns `(*storage.AgentRow, error)` so serialization failures are not discarded
+
+**Validation and defaults:** `ApplyDefaults()` trims user-facing fields, normalizes
+the model provider, and supplies the configured runtime image when omitted.
+`Validate()` requires a name, goal, instructions, a whitespace-free runtime image,
+and the initial supported cagent model contract: provider `google` plus a model name.
+Validation errors identify a stable field name and message for HTTP clients.
 
 ---
 
@@ -276,8 +282,9 @@ type ScheduleConfig struct {
 **`Service` struct**:
 ```go
 type Service struct {
-	repo    *storage.AgentRepository
-	runRepo *storage.RunRepository
+	repo         *storage.AgentRepository
+	runRepo      *storage.RunRepository
+	defaultImage string
 }
 ```
 
@@ -285,15 +292,14 @@ type Service struct {
 
 | Method | Description |
 |---|---|
-| `CreateAgent(ctx, *AgentDefinition)` | Validates ID, sets timestamps/version=1, calls `repo.Save()` |
+| `CreateAgent(ctx, *AgentDefinition)` | Applies defaults, validates fields, assigns a UUID and UTC timestamps, sets version `1`, then saves |
 | `GetAgent(ctx, id)` | `repo.GetByID()` → `storageRowToAgent()` |
 | `ListAgents(ctx)` | `repo.List()` → map `storageRowToAgent()` |
-| `UpdateAgent(ctx, def)` | Loads existing, preserves `CreatedAt`, increments `Version`, saves |
+| `UpdateAgent(ctx, def)` | Applies defaults and validation, loads existing, preserves `CreatedAt`, increments `Version`, saves |
 | `DeleteAgent(ctx, id)` | Deletes runs via `runRepo.DeleteByAgentID()`, then agent |
 | `GetAgentWithRuns(ctx, id)` | Loads agent + runs via `runRepo.ListByAgentID()`, merges |
 
 **Conversion helpers** (package-private):
-- `toStorageRow()` — same as `ToStorageRow()` on model
 - `storageRowToAgent(*storage.AgentRow)` — unmarshals JSON fields, reconstructs `ScheduleConfig`
 - `storageRunRowToRun(*storage.RunRow)` → `run.RunRecord` with type conversion for `RunStatus`
 

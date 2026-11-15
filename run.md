@@ -69,7 +69,7 @@ curl http://127.0.0.1:8080/api/health
 # Create an agent
 curl -X POST http://127.0.0.1:8080/api/agents \
   -H "Content-Type: application/json" \
-  -d '{"name":"test-agent","goal":"Report status","instructions":"Say hello"}'
+  -d '{"name":"test-agent","goal":"Report status","instructions":"Say hello","model_config":{"provider":"google","model":"gemini-3.5-flash-lite"}}'
 
 # List agents
 curl http://127.0.0.1:8080/api/agents
@@ -82,6 +82,11 @@ curl -X POST http://127.0.0.1:8080/api/runs \
 # List runs for an agent
 curl "http://127.0.0.1:8080/api/runs?agent_id=<AGENT_ID>"
 ```
+
+Agent creation requires `name`, `goal`, `instructions`, and a Google
+`model_config.provider` / `model_config.model`. Omit `runtime_config.image` to use
+the configured default image. Validation failures return HTTP `400` with JSON in the
+form `{"error":"validation_error","field":"...","message":"..."}`.
 
 ---
 
