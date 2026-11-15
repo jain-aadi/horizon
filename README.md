@@ -7,7 +7,7 @@ A local-first, no-code AI agent platform built in Go. Create, configure, run, an
 | Component | Technology |
 |-----------|------------|
 | Application Core | Go 1.26 (stdlib only) |
-| Agent Runtime | [cagent](https://github.com/docker/cagent) (Docker Agent) |
+| Agent Runtime | [Docker Agent](https://github.com/docker/docker-agent) v1.158.0, pinned to commit `7f94f376a5d10320591d959b351ca1eeb07c959a` |
 | Container Backend | Rootless Podman |
 | Persistence | SQLite via `modernc.org/sqlite` (CGO-free) |
 | API | RESTful HTTP (JSON) |
@@ -72,6 +72,21 @@ Agent creation requires `name`, `goal`, `instructions`, and a Google
 Horizon applies the configured default image. Validation failures return HTTP `400`
 with JSON in the form `{"error":"validation_error","field":"...","message":"..."}`.
 
+## Docker Agent Configuration Contract
+
+The Task 5 configuration adapter emits YAML for the pinned Docker Agent v1.158.0
+configuration schema version `16`: one `root` agent, one generated Google model, and
+an instruction assembled from the saved goal and instructions. Generated YAML uses
+`gopkg.in/yaml.v3` rather than hand-built strings. Task 6 will wire this adapter into
+the production run path; the current executor still uses its hardcoded `agent.yaml`.
+
+Capabilities, filesystem/network/shell/secret permissions, model API-key references,
+and arbitrary model parameters are rejected by the adapter for now. They must not be
+silently represented in YAML because their execution-boundary enforcement is part of
+the later run and sandbox work. This is not yet API/runtime enforcement until Task 6.
+Credentials continue to come only from the execution environment, never from generated
+agent YAML.
+
 ## Configuration
 
 | Environment Variable | Default | Description |
@@ -110,13 +125,13 @@ horizon/
 │   ├── agent/                  # Agent domain (model, service, repository)
 │   ├── run/                    # Run domain (model, coordinator, repository)
 │   ├── scheduler/              # Phase 4: cron, scheduling
-│   ├── cagent/                 # cagent adapter (stub)
+│   ├── cagent/                 # Pinned Docker Agent YAML adapter
 │   ├── storage/sqlite.go       # SQLite persistence + versioned embedded migrations
 │   ├── permissions/            # Permission types & validation
 │   ├── config/config.go        # Application configuration
 │   ├── api/handler.go          # HTTP handlers (CRUD + execution)
 │   └── sandbox/podman.go       # Podman engine (create, run, logs, health)
-├── runtime/Containerfile       # Sandbox image build (cagent + Alpine)
+├── runtime/Containerfile       # Pinned Docker Agent sandbox image build
 ├── tests/                      # Integration tests (require Podman)
 ├── web/                        # Future web UI
 ├── go.mod / go.sum

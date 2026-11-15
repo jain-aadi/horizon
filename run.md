@@ -7,6 +7,7 @@
 | Go | `go 1.26.0` (project `go.mod`) |
 | Podman | Rootless Podman with socket at `$XDG_RUNTIME_DIR/podman/podman.sock` (default) |
 | Credentials | `GOOGLE_API_KEY` environment variable exported before running |
+| Agent runtime | Docker Agent v1.158.0 at commit `7f94f376a5d10320591d959b351ca1eeb07c959a`, built by `runtime/Containerfile` |
 | Database | `./data/horizon.db` will be created automatically on first start |
 | Port | API listens on `127.0.0.1:8080` by default |
 
@@ -44,7 +45,7 @@ The server runs until interrupted (Ctrl+C). Graceful shutdown is handled.
 
 | Variable | Default | Description |
 |---|---|---|
-| `GOOGLE_API_KEY` | _(required)_ | API key for Google Gemini provider used by cagent |
+| `GOOGLE_API_KEY` | _(required)_ | API key for Google Gemini provider used by Docker Agent |
 | `HORIZON_DB_PATH` | `./data/horizon.db` | Path to SQLite database |
 | `HORIZON_PORT` | `8080` | HTTP server port |
 | `HORIZON_SOCKET` | `$XDG_RUNTIME_DIR/podman/podman.sock` | Podman socket path |
@@ -60,7 +61,21 @@ and malformed lines are ignored. Timeout values use Go duration syntax and must 
 greater than zero, for example `30s` or `10m`. Startup fails when `HORIZON_PORT` is
 not an integer from 1 through 65535 or a configured timeout is invalid.
 
-### 4. Test with curl
+### 4. Pinned Docker Agent contract
+
+The sandbox image builds Docker Agent v1.158.0 and verifies the tag resolves to
+commit `7f94f376a5d10320591d959b351ca1eeb07c959a`. The runtime command is
+`docker-agent run --exec --last /workspace/<agent.yaml> <prompt>`; the existing
+Podman engine supplies the `run --exec --last` arguments after the image entrypoint.
+
+The Task 5 adapter generates schema version `16` YAML with one `root` agent and one
+Google model. When Task 6 wires it into execution, it will reject unsupported
+capabilities, filesystem/network/shell/secret permission requests, model API-key
+references, and arbitrary model parameters instead of silently weakening the requested
+policy. The current API and executor still persist those fields and use hardcoded
+`agent.yaml`; runtime materialization is deferred to the next execution-coordinator task.
+
+### 5. Test with curl
 
 ```bash
 # Health check
@@ -120,7 +135,7 @@ form `{"error":"validation_error","field":"...","message":"..."}`.
 | **Docker compatibility** | Image `localhost/horizon-sandbox:latest` must be built/pulled separately |
 | **Volume mounts beyond /workspace** | Only `/workspace:ro,Z` mount is configured; no additional host paths |
 | **Resource limits** | CPU/memory limits configurable but not enforced in current sandbox |
-| **Network access inside container** | `slirp4netns` sandboxed; no outbound network from cagent by default |
+| **Network access inside container** | `slirp4netns` provides user-mode NAT egress, which Google model calls require; Horizon does not yet enforce `network_access` or outbound-destination restrictions |
 | **Secret management** | `GOOGLE_API_KEY` passed as env var; no secret vault integration |
 | **CLI** | No CLI binary built yet (only HTTP API; `horizond` and `horizond.exe` binaries exist from prior build) |
 

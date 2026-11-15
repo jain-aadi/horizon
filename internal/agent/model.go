@@ -6,8 +6,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/horizon/horizon/internal/run"
-	"github.com/horizon/horizon/internal/storage"
+	"github.com/jain-aadi/horizon/internal/run"
+	"github.com/jain-aadi/horizon/internal/storage"
 )
 
 // AgentDefinition represents the durable description of an agent.

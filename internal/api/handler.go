@@ -12,10 +12,10 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/horizon/horizon/internal/agent"
-	"github.com/horizon/horizon/internal/run"
-	"github.com/horizon/horizon/internal/sandbox"
-	"github.com/horizon/horizon/internal/storage"
+	"github.com/jain-aadi/horizon/internal/agent"
+	"github.com/jain-aadi/horizon/internal/run"
+	"github.com/jain-aadi/horizon/internal/sandbox"
+	"github.com/jain-aadi/horizon/internal/storage"
 )
 
 // Handler implements the HTTP API.

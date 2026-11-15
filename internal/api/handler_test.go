@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/horizon/horizon/internal/agent"
-	"github.com/horizon/horizon/internal/storage"
+	"github.com/jain-aadi/horizon/internal/agent"
+	"github.com/jain-aadi/horizon/internal/storage"
 )
 
 const handlerTestDefaultImage = "localhost/horizon-sandbox:test"

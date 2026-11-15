@@ -1,12 +1,17 @@
-agents:
-  root:
-    model: gemini-flash
-    description: "Isolated sandbox verification agent"
-    instruction: |
-      You are running inside an isolated Rootless Podman container managed by Horizon.
-      Respond concisely in 2 bullet points confirming you are online and ready to receive tasks.
+version: "16"
 
 models:
-  gemini-flash:
+  horizon-model:
     provider: google
     model: gemini-3.5-flash-lite
+
+agents:
+  root:
+    model: horizon-model
+    description: Isolated sandbox verification agent
+    instruction: |
+      Goal:
+      Confirm the isolated Horizon runtime is available.
+
+      Instructions:
+      Respond concisely in two bullet points confirming that you are online and ready to receive tasks.

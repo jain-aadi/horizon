@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/horizon/horizon/internal/storage"
+	"github.com/jain-aadi/horizon/internal/storage"
 )
 
 const testDefaultImage = "localhost/horizon-sandbox:test"

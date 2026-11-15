@@ -12,10 +12,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/horizon/horizon/internal/api"
-	"github.com/horizon/horizon/internal/config"
-	"github.com/horizon/horizon/internal/sandbox"
-	"github.com/horizon/horizon/internal/storage"
+	"github.com/jain-aadi/horizon/internal/api"
+	"github.com/jain-aadi/horizon/internal/config"
+	"github.com/jain-aadi/horizon/internal/sandbox"
+	"github.com/jain-aadi/horizon/internal/storage"
 )
 
 // loadEnvFile loads simple KEY=VALUE entries from a .env file without

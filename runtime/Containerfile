@@ -1,22 +1,24 @@
-# Stage 1: Build the standalone cagent binary
+# Stage 1: Build the pinned standalone Docker Agent binary.
 FROM golang:1.27-alpine AS builder
 RUN apk add --no-cache git
 WORKDIR /src
-# Clone the official Docker Agent (cagent) repo and build the binary
-RUN git clone --depth 1 https://github.com/docker/cagent.git . && \
-    CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /cagent .
+ARG DOCKER_AGENT_VERSION=v1.158.0
+ARG DOCKER_AGENT_COMMIT=7f94f376a5d10320591d959b351ca1eeb07c959a
+RUN git clone --depth 1 --branch "${DOCKER_AGENT_VERSION}" https://github.com/docker/docker-agent.git . && \
+    test "$(git rev-parse HEAD)" = "${DOCKER_AGENT_COMMIT}" && \
+    CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /docker-agent .
 
 # Stage 2: Minimal isolated runtime environment
 FROM alpine:3.21
 RUN apk add --no-cache ca-certificates curl jq bash python3
 
 # Copy the compiled binary
-COPY --from=builder /cagent /usr/local/bin/cagent
-RUN chmod +x /usr/local/bin/cagent
+COPY --from=builder /docker-agent /usr/local/bin/docker-agent
+RUN chmod +x /usr/local/bin/docker-agent
 
 # Create an unprivileged user inside the container
 RUN adduser -D -u 1000 agentuser
 USER agentuser
 WORKDIR /workspace
 
-ENTRYPOINT ["cagent"]
+ENTRYPOINT ["docker-agent"]

@@ -48,7 +48,7 @@ horizon/
 ├── tests/                          # Empty — Integration tests (require Podman socket)
 ├── runtime/
 │   └── Containerfile               # Multi-stage build: cagent binary + minimal Alpine runtime
-├── go.mod                          # Module: github.com/horizon/horizon, Go 1.26.0
+├── go.mod                          # Module: github.com/jain-aadi/horizon, Go 1.26.0
 ├── go.sum                          # Dependency checksums
 ├── project.md                      # Product spec and roadmap
 ├── run.md                          # Operations guide (health check, curl examples, capabilities, troubleshooting)
@@ -63,7 +63,7 @@ horizon/
 ### 1. `go.mod`
 
 ```go
-module github.com/horizon/horizon
+module github.com/jain-aadi/horizon
 
 go 1.26.0
 
@@ -84,7 +84,7 @@ require (
 )
 ```
 
-- **Module path**: `github.com/horizon/horizon` (canonical import path)
+- **Module path**: `github.com/jain-aadi/horizon` (canonical import path)
 - **Go version**: `1.26.0` — uses `modernc.org/sqlite` (pure Go) so `CGO_ENABLED=0` builds work
 - **Key dependencies**: `google/uuid` for run/agent IDs; `modernc.org/sqlite` for CGO-free SQLite
 
@@ -106,10 +106,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/horizon/horizon/internal/api"
-	"github.com/horizon/horizon/internal/config"
-	"github.com/horizon/horizon/internal/sandbox"
-	"github.com/horizon/horizon/internal/storage"
+	"github.com/jain-aadi/horizon/internal/api"
+	"github.com/jain-aadi/horizon/internal/config"
+	"github.com/jain-aadi/horizon/internal/sandbox"
+	"github.com/jain-aadi/horizon/internal/storage"
 )
 ```
 
@@ -389,33 +389,29 @@ type RunRepository interface {
 
 ---
 
-### 11. `internal/cagent/adapter.go` — cagent Integration Layer
+### 11. `internal/cagent/adapter.go` — Docker Agent Configuration Boundary
 
 ```go
-type AgentConfig struct {
-	Name        string            `yaml:"name"`
-	Goal        string            `yaml:"goal"`
-	Instructions string           `yaml:"instructions"`
-	Model       ModelConfig       `yaml:"model"`
-	Tools       []ToolConfig      `yaml:"tools,omitempty"`
-	Permissions PermissionsConfig `yaml:"permissions"`
-	Timeout     time.Duration     `yaml:"timeout,omitempty"`
-}
-
 type Adapter interface {
-	BuildConfig(ctx context.Context, agentDef interface{}) (*AgentConfig, error)
-	Execute(ctx context.Context, config *AgentConfig, workspaceDir string, prompt string, outputWriter interface{}) (string, error)
-	ValidateConfig(config *AgentConfig) error
-}
-
-type DefaultAdapter struct {
-	imageName        string
-	containerTimeout time.Duration
+	BuildConfig(agentDef *agent.AgentDefinition) (*Config, error)
+	MarshalConfig(config *Config) ([]byte, error)
+	ValidateConfig(config *Config) error
 }
 ```
 
-**Current state**: `BuildConfig` returns hardcoded stub; `Execute` returns `ErrNotImplemented`. 
-**Future**: Convert `agent.AgentDefinition` → `AgentConfig` (YAML), delegate `Execute` to `sandbox.Engine`.
+The adapter targets Docker Agent `v1.158.0`, immutable commit
+`7f94f376a5d10320591d959b351ca1eeb07c959a`, and YAML configuration schema version
+`16`. It maps a validated Horizon definition to a single `agents.root` entry and a
+single generated `models.horizon-model` definition. The root instruction contains both
+the Horizon goal and instructions; `description` uses the saved description or falls
+back to the agent name.
+
+The configuration is serialized through `gopkg.in/yaml.v3`, then validated before it
+is returned. The adapter deliberately rejects capabilities, filesystem/network/shell/
+secret permissions, model API-key references, and arbitrary model parameters: Docker
+Agent YAML alone cannot enforce Horizon's execution policy. Credentials remain outside
+the YAML and are supplied by the controlled execution environment. Config materialization
+and execution ownership remain Task 6 responsibilities.
 
 ---
 
@@ -584,29 +580,32 @@ type Config struct {
 ### 17. `runtime/Containerfile` — Sandbox Image Build
 
 ```dockerfile
-# Stage 1: Build cagent
+# Stage 1: Build the pinned Docker Agent release
 FROM golang:1.27-alpine AS builder
 RUN apk add --no-cache git
 WORKDIR /src
-RUN git clone --depth 1 https://github.com/docker/cagent.git . && \
-    CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /cagent .
+ARG DOCKER_AGENT_VERSION=v1.158.0
+ARG DOCKER_AGENT_COMMIT=7f94f376a5d10320591d959b351ca1eeb07c959a
+RUN git clone --depth 1 --branch "${DOCKER_AGENT_VERSION}" https://github.com/docker/docker-agent.git . && \
+    test "$(git rev-parse HEAD)" = "${DOCKER_AGENT_COMMIT}" && \
+    CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /docker-agent .
 
 # Stage 2: Minimal runtime
 FROM alpine:3.21
 RUN apk add --no-cache ca-certificates curl jq bash python3
-COPY --from=builder /cagent /usr/local/bin/cagent
-RUN chmod +x /usr/local/bin/cagent
+COPY --from=builder /docker-agent /usr/local/bin/docker-agent
+RUN chmod +x /usr/local/bin/docker-agent
 RUN adduser -D -u 1000 agentuser
 USER agentuser
 WORKDIR /workspace
-ENTRYPOINT ["cagent"]
+ENTRYPOINT ["docker-agent"]
 ```
 
 **Notes**:
-- Builds cagent from source (no version pin — clones `main` branch)
+- Builds Docker Agent v1.158.0 and fails the image build unless the checkout is commit `7f94f376a5d10320591d959b351ca1eeb07c959a`
 - Installs `python3`, `curl`, `jq`, `bash` — relatively heavy
 - Runs as non-root `agentuser` (UID 1000)
-- Entrypoint is raw `cagent` — no Horizon wrapper
+- Entrypoint is `docker-agent`; Podman supplies `run --exec --last /workspace/<agent.yaml> <prompt>`
 - Build with: `podman build -t localhost/horizon-sandbox:latest ./runtime`
 
 ---
@@ -616,7 +615,8 @@ ENTRYPOINT ["cagent"]
 | `project.md` §14 Requirement | Implementation Status |
 |---|---|
 | Preserve Go-to-Podman integration | ✅ `internal/sandbox/podman.go` — cleaned, configurable, tested |
-| Stabilize cagent invocation | ✅ `internal/cagent/adapter.go` + `podman.go::buildCmd()` |
+| Pin and validate Docker Agent configuration | ✅ `internal/cagent/adapter.go` + `workspace/test-agent.yaml` |
+| Materialize saved agent configuration for execution | ⏳ Task 6; current handler still uses hardcoded `agent.yaml` |
 | Capture output, errors, exit status | ✅ `RunOptions.OutputWriter`, `RunResult`, `RunRecord` |
 | Handle timeouts and cleanup | ✅ `ContainerTimeout`, defer cleanup with verification |
 | Health checks | ✅ `Engine.HealthCheck()` — socket + image |
