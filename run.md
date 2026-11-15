@@ -52,7 +52,7 @@ The server runs until interrupted (Ctrl+C). Graceful shutdown is handled.
 | `HORIZON_IMAGE` | `localhost/horizon-sandbox:latest` | Container image for agent execution |
 | `HORIZON_REQUEST_TIMEOUT` | `30s` | Podman API request timeout |
 | `HORIZON_CONTAINER_TIMEOUT` | `10m` | Maximum duration of one container execution |
-| `HORIZON_AGENT_TIMEOUT` | `10m` | Configured default agent timeout; not yet enforced by the run executor |
+| `HORIZON_AGENT_TIMEOUT` | `10m` | Maximum duration of one materialized agent run |
 
 Configuration precedence is: built-in defaults, optional `.env` entries, inherited
 process environment, then explicitly supplied `--db` and `--port` flags. The `.env`
@@ -68,12 +68,17 @@ commit `7f94f376a5d10320591d959b351ca1eeb07c959a`. The runtime command is
 `docker-agent run --exec --last /workspace/<agent.yaml> <prompt>`; the existing
 Podman engine supplies the `run --exec --last` arguments after the image entrypoint.
 
-The Task 5 adapter generates schema version `16` YAML with one `root` agent and one
-Google model. When Task 6 wires it into execution, it will reject unsupported
-capabilities, filesystem/network/shell/secret permission requests, model API-key
-references, and arbitrary model parameters instead of silently weakening the requested
-policy. The current API and executor still persist those fields and use hardcoded
-`agent.yaml`; runtime materialization is deferred to the next execution-coordinator task.
+The execution coordinator materializes the saved agent definition for every accepted
+run into `<database-directory>/runs/<RUN_ID>/agent.yaml`. It uses the Task 5 adapter's
+schema-`16` YAML with one `root` agent and one Google model; no shared project-root
+`agent.yaml` is used. Unsupported capabilities, filesystem/network/shell/secret
+permission requests, model API-key references, and arbitrary model parameters fail the
+run during materialization rather than silently weakening the requested policy.
+
+The same workspace holds a bounded `output.log`. The run row stores only a safe
+relative output reference, and `GET /api/runs/{id}/output` resolves it under the run
+artifact root before reading. `POST /api/runs/{id}?action=cancel` persists cancellation,
+cancels the active context, and requests removal of the known container.
 
 ### 5. Test with curl
 
@@ -96,6 +101,12 @@ curl -X POST http://127.0.0.1:8080/api/runs \
 
 # List runs for an agent
 curl "http://127.0.0.1:8080/api/runs?agent_id=<AGENT_ID>"
+
+# Inspect output or cancel an active run
+curl http://127.0.0.1:8080/api/runs/<RUN_ID>/output
+curl -X POST "http://127.0.0.1:8080/api/runs/<RUN_ID>?action=cancel" \
+  -H "Content-Type: application/json" \
+  -d '{"reason":"No longer needed"}'
 ```
 
 Agent creation requires `name`, `goal`, `instructions`, and a Google
@@ -112,12 +123,12 @@ form `{"error":"validation_error","field":"...","message":"..."}`.
 | Category | Details |
 |---|---|
 | **Agent lifecycle** | Create, list, get, update, delete agents via HTTP API |
-| **Run execution** | Manual trigger via API; agent executes in Podman container |
+| **Run execution** | Manual trigger materializes a saved definition into a per-run Docker Agent YAML workspace, then executes it in Podman |
 | **Persistence** | SQLite stores agent definitions, run history, schedules across restarts |
 | **Run status** | `queued` → `running` → `succeeded`/`failed`/`cancelled`/`timed_out` |
-| **Container management** | Auto-create, start, stream logs, wait for exit, auto-remove (deferred) |
+| **Container management** | Auto-create, start, stream bounded output, wait for exit, and request removal on cancellation; engine cleanup also removes containers |
 | **Health checks** | Podman socket reachability + image existence check |
-| **Cancel runs** | In-progress runs can be cancelled via `POST /api/runs/{id}?action=cancel` |
+| **Cancel runs** | Active runs are durably cancelled via `POST /api/runs/{id}?action=cancel`; late completion cannot replace `cancelled` |
 | **Configuration** | `.env`, process environment, and explicit `--db` / `--port` overrides; database path, image, socket path, API timeout, and container timeout are applied |
 | **HTTP API** | RESTful endpoints: `/api/agents`, `/api/runs`, `/api/health` |
 

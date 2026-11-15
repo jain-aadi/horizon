@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -127,6 +128,7 @@ func main() {
 	handler := api.NewHandler(agentRepo, runRepo, engine, &api.Config{
 		DefaultTimeout: cfg.Agent.DefaultTimeout,
 		DefaultImage:   cfg.Agent.DefaultImage,
+		DataDir:        filepath.Dir(cfg.Database.Path),
 	})
 
 	// Setup HTTP server

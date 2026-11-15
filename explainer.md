@@ -27,8 +27,9 @@ horizon/
 │   │   └── repository.go           # Repository interfaces (AgentRepository, RunRepository) + local RunRecord alias
 │   ├── run/                        # Run execution domain
 │   │   ├── model.go                # RunStatus constants + RunRecord struct
-│   │   ├── coordinator.go          # RunCoordinator interface (ExecuteRun, CancelRun, GetRunStatus)
-│   │   └── repository.go           # RunRepository interface
+│   │   ├── coordinator.go          # RunCoordinator lifecycle contract
+│   │   ├── repository.go           # Domain repository + SQLite adapter
+│   │   └── service.go              # Per-run materialization, execution, output, cancellation
 │   ├── scheduler/                  # Empty — Phase 4 (scheduling, cron, pause/resume)
 │   ├── cagent/                     # cagent integration layer
 │   │   └── adapter.go              # Adapter interface + DefaultAdapter (BuildConfig, ValidateConfig, Execute stub)
@@ -174,7 +175,7 @@ type AgentConfig struct {
 negative, or invalid timeout durations. The daemon loads the optional `.env` file
 before invoking `LoadFromEnv()`; the loader accepts unquoted `KEY=VALUE` lines and
 does not overwrite a value inherited from the process environment. `HORIZON_AGENT_TIMEOUT`
-is currently configuration only—the run executor does not yet enforce it.
+bounds every materialized agent run through its execution context.
 
 ---
 
@@ -183,7 +184,7 @@ is currently configuration only—the run executor does not yet enforce it.
 **Core types**:
 - `EngineConfig` — `SocketPath`, `ImageName`, `APIVersion`, `RequestTimeout`, `ContainerTimeout`
 - `Engine` — wraps `config` + `*http.Client` with Unix socket dialer
-- `RunOptions` — `WorkspaceDir`, `YAMLFile`, `Prompt`, `APIKey`, `OutputWriter`, `Env`
+- `RunOptions` — `WorkspaceDir`, `YAMLFile`, `Prompt`, `APIKey`, `OutputWriter`, `Env`, `OnContainerCreated`
 - `RunResult` — `ContainerID`, `ExitCode`, `Error`
 - `createReq` / `hostConfig` / `createResp` / `waitResp` — Podman API DTOs
 
@@ -366,26 +367,35 @@ type RunRecord struct {
 
 ```go
 type RunCoordinator interface {
-	ExecuteRun(ctx context.Context, agentID string, triggerType string) (*RunRecord, error)
+	StartRun(ctx context.Context, agentID string, triggerType string, prompt string) (*RunRecord, error)
 	CancelRun(ctx context.Context, runID string, reason string) error
 	GetRunStatus(ctx context.Context, runID string) (RunStatus, error)
+	GetRun(ctx context.Context, runID string) (*RunRecord, error)
+	ReadOutput(ctx context.Context, runID string) ([]byte, error)
 }
 ```
 
-**Status**: Defines interface for future orchestrator; not yet implemented (Phase 1 uses `handler.executeRun` directly).
+`Service` implements this contract. It persists a `queued` row before launching a
+background worker, snapshots the selected agent ID/version, materializes a unique
+Docker Agent YAML workspace, captures bounded output, and persists a single terminal
+outcome. It protects cancellation with an in-memory active-run registry so a late
+worker completion cannot overwrite `cancelled`.
 
 ---
 
-### 10. `internal/run/repository.go` — RunRepository Interface
+### 10. `internal/run/repository.go` — Run Repository Interface
 
 ```go
 type RunRepository interface {
 	Save(ctx context.Context, rec *RunRecord) error
 	GetByID(ctx context.Context, id string) (*RunRecord, error)
-	ListByAgentID(ctx context.Context, agentID string) ([]RunRecord, error)
+	ListByAgentID(ctx context.Context, agentID string) ([]*RunRecord, error)
 	DeleteByAgentID(ctx context.Context, agentID string) error
 }
 ```
+
+`StorageRepository` adapts `storage.RunRepository` rows to this domain interface, so
+run lifecycle code no longer performs SQL-null conversions in HTTP handlers.
 
 ---
 
@@ -410,8 +420,9 @@ The configuration is serialized through `gopkg.in/yaml.v3`, then validated befor
 is returned. The adapter deliberately rejects capabilities, filesystem/network/shell/
 secret permissions, model API-key references, and arbitrary model parameters: Docker
 Agent YAML alone cannot enforce Horizon's execution policy. Credentials remain outside
-the YAML and are supplied by the controlled execution environment. Config materialization
-and execution ownership remain Task 6 responsibilities.
+the YAML and are supplied by the controlled execution environment. The run service
+calls this adapter for every accepted run and writes the resulting configuration to the
+run's isolated workspace before container creation.
 
 ---
 
@@ -529,20 +540,23 @@ type ServerConfig struct {
 
 ---
 
-### 16. `internal/api/handler.go` — HTTP Handlers (Complete CRUD + Execution)
+### 16. `internal/api/handler.go` — HTTP Handlers (Complete CRUD + Coordinated Execution)
 
 **`Handler` struct**:
 ```go
 type Handler struct {
-	agentRepo *storage.AgentRepository
-	runRepo   *storage.RunRepository
-	engine    *sandbox.Engine
-	config    *Config
+	agentService *agent.Service
+	runRepo      *storage.RunRepository
+	runService   run.RunCoordinator
+	engine       Engine
+	config       *Config
 }
 
 type Config struct {
 	DefaultTimeout time.Duration
 	DefaultImage   string
+	DataDir        string
+	MaxOutputBytes int64
 }
 ```
 
@@ -558,20 +572,16 @@ type Config struct {
 | GET | `/api/runs?agent_id=` | `listRuns` |
 | POST | `/api/runs` | `createRun` |
 | GET | `/api/runs/{id}` | `getRun` |
+| GET | `/api/runs/{id}/output` | `getRunOutput` |
 | POST | `/api/runs/{id}?action=cancel` | `cancelRun` |
 
-**Execution flow** (`createRun` → goroutine `executeRun`):
-1. Decode request → validate `agent_id`, `prompt`
-2. `agentRepo.GetByID()` → `agentRow`
-3. Create `RunRow` with `Status="queued"`, save
-4. **Async goroutine** `executeRun()`:
-   - Update run to `running`
-   - Build `sandbox.RunOptions` (workspace=".", yaml="agent.yaml", TODO: generate from agent)
-   - `engine.RunAgent(ctx, opts)` → `RunResult`
-   - On error: status=`failed`, error message
-   - On success: status=`succeeded`/`failed` based on exit code
-   - Set `CompletedAt`, `ContainerID`, `ExitCode`
-   - Save final run record
+**Execution flow** (`createRun` → `run.Service.StartRun`):
+1. Decode and validate `agent_id` and `prompt`; generic request-provided environment is not accepted.
+2. Load the saved agent, persist a `queued` run with its agent version, and return HTTP `202`.
+3. Background work writes `<database-directory>/runs/<RUN_ID>/agent.yaml` using the pinned adapter and creates bounded `output.log` alongside it.
+4. The service transitions to `running`, invokes `Engine.RunAgent`, records the container ID at creation, and writes streamed logs to `output.log`.
+5. It persists `succeeded`, `failed`, `timed_out`, or `cancelled` once with completion time, exit code, error, and output reference.
+6. Cancellation persists `cancelled`, cancels the active context, and requests removal of a known container. The output route validates the stored relative reference remains under the artifact root before reading.
 
 **Health check**: Calls `engine.HealthCheck(ctx)` with 5s timeout.
 
@@ -616,9 +626,9 @@ ENTRYPOINT ["docker-agent"]
 |---|---|
 | Preserve Go-to-Podman integration | ✅ `internal/sandbox/podman.go` — cleaned, configurable, tested |
 | Pin and validate Docker Agent configuration | ✅ `internal/cagent/adapter.go` + `workspace/test-agent.yaml` |
-| Materialize saved agent configuration for execution | ⏳ Task 6; current handler still uses hardcoded `agent.yaml` |
-| Capture output, errors, exit status | ✅ `RunOptions.OutputWriter`, `RunResult`, `RunRecord` |
-| Handle timeouts and cleanup | ✅ `ContainerTimeout`, defer cleanup with verification |
+| Materialize saved agent configuration for execution | ✅ `run.Service` writes isolated, adapter-generated per-run YAML |
+| Capture output, errors, exit status | ✅ Bounded `output.log`, `RunResult`, and durable `RunRecord` fields |
+| Handle timeouts and cancellation | ✅ Agent timeout context, cancellation registry, known-container removal request, and terminal-state protection |
 | Health checks | ✅ `Engine.HealthCheck()` — socket + image |
 | SQLite persistence | ✅ Agents, runs, schedules with migrations |
 | Structured run records | ✅ Status enum, timestamps, exit code, output ref, container ID |

@@ -10,16 +10,17 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"time"
 )
 
 // EngineConfig holds configuration for the Podman engine.
 type EngineConfig struct {
-	SocketPath      string
-	ImageName       string
-	APIVersion      string
-	RequestTimeout  time.Duration
+	SocketPath       string
+	ImageName        string
+	APIVersion       string
+	RequestTimeout   time.Duration
 	ContainerTimeout time.Duration
 }
 
@@ -32,17 +33,18 @@ func DefaultEngineConfig() EngineConfig {
 	sock := filepath.Join(xdg, "podman", "podman.sock")
 
 	return EngineConfig{
-		SocketPath:      sock,
-		ImageName:       "localhost/horizon-sandbox:latest",
-		APIVersion:      "v4.0.0",
-		RequestTimeout:  30 * time.Second,
+		SocketPath:       sock,
+		ImageName:        "localhost/horizon-sandbox:latest",
+		APIVersion:       "v4.0.0",
+		RequestTimeout:   30 * time.Second,
 		ContainerTimeout: 10 * time.Minute,
 	}
 }
 
 type Engine struct {
-	config     EngineConfig
-	httpClient *http.Client
+	config       EngineConfig
+	httpClient   *http.Client
+	streamClient *http.Client
 }
 
 type createReq struct {
@@ -54,11 +56,11 @@ type createReq struct {
 }
 
 type hostConfig struct {
-	Binds        []string `json:"Binds,omitempty"`
-	AutoRemove   bool     `json:"AutoRemove,omitempty"`
-	NetworkMode  string   `json:"NetworkMode,omitempty"`
-	CapDrop      []string `json:"CapDrop,omitempty"`
-	LogConfig    logConfig `json:"LogConfig,omitempty"`
+	Binds       []string  `json:"Binds,omitempty"`
+	AutoRemove  bool      `json:"AutoRemove,omitempty"`
+	NetworkMode string    `json:"NetworkMode,omitempty"`
+	CapDrop     []string  `json:"CapDrop,omitempty"`
+	LogConfig   logConfig `json:"LogConfig,omitempty"`
 }
 
 type logConfig struct {
@@ -79,18 +81,18 @@ func NewEngine(config EngineConfig) (*Engine, error) {
 		return nil, fmt.Errorf("podman socket not found at %s (run: systemctl --user start podman.socket)", config.SocketPath)
 	}
 
-	client := &http.Client{
-		Timeout: config.RequestTimeout,
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return net.Dial("unix", config.SocketPath)
-			},
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return net.Dial("unix", config.SocketPath)
 		},
 	}
+	client := &http.Client{Timeout: config.RequestTimeout, Transport: transport}
+	streamClient := &http.Client{Transport: transport}
 
 	return &Engine{
-		config:     config,
-		httpClient: client,
+		config:       config,
+		httpClient:   client,
+		streamClient: streamClient,
 	}, nil
 }
 
@@ -122,12 +124,13 @@ func demuxStream(r io.Reader, out io.Writer) error {
 
 // RunOptions holds options for running an agent.
 type RunOptions struct {
-	WorkspaceDir string
-	YAMLFile     string
-	Prompt       string
-	APIKey       string
-	OutputWriter io.Writer
-	Env          map[string]string
+	WorkspaceDir       string
+	YAMLFile           string
+	Prompt             string
+	APIKey             string
+	OutputWriter       io.Writer
+	Env                map[string]string
+	OnContainerCreated func(containerID string)
 }
 
 // RunResult contains the result of a run.
@@ -197,6 +200,9 @@ func (e *Engine) RunAgent(ctx context.Context, opts RunOptions) (*RunResult, err
 		return nil, fmt.Errorf("decode container create response: %w", err)
 	}
 	containerID := created.ID
+	if opts.OnContainerCreated != nil {
+		opts.OnContainerCreated(containerID)
+	}
 
 	// Ensure cleanup runs even on error/panic
 	defer func() {
@@ -277,7 +283,7 @@ func (e *Engine) buildCmd(yamlFile, prompt string) []string {
 		"run",
 		"--exec",
 		"--last",
-		filepath.Join("/workspace", yamlFile),
+		path.Join("/workspace", yamlFile),
 		prompt,
 	}
 }
@@ -290,7 +296,7 @@ func (e *Engine) StreamLogs(ctx context.Context, containerID string, out io.Writ
 		return err
 	}
 
-	logResp, err := e.httpClient.Do(logReq)
+	logResp, err := e.streamClient.Do(logReq)
 	if err != nil {
 		return err
 	}

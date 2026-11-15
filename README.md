@@ -65,6 +65,13 @@ curl -X POST http://127.0.0.1:8080/api/runs \
 
 # List runs for an agent
 curl "http://127.0.0.1:8080/api/runs?agent_id=<AGENT_ID>"
+
+# Inspect one run, retrieve its bounded local output, or cancel it
+curl http://127.0.0.1:8080/api/runs/<RUN_ID>
+curl http://127.0.0.1:8080/api/runs/<RUN_ID>/output
+curl -X POST "http://127.0.0.1:8080/api/runs/<RUN_ID>?action=cancel" \
+  -H "Content-Type: application/json" \
+  -d '{"reason":"No longer needed"}'
 ```
 
 Agent creation requires `name`, `goal`, `instructions`, and a Google
@@ -74,18 +81,21 @@ with JSON in the form `{"error":"validation_error","field":"...","message":"..."
 
 ## Docker Agent Configuration Contract
 
-The Task 5 configuration adapter emits YAML for the pinned Docker Agent v1.158.0
-configuration schema version `16`: one `root` agent, one generated Google model, and
-an instruction assembled from the saved goal and instructions. Generated YAML uses
-`gopkg.in/yaml.v3` rather than hand-built strings. Task 6 will wire this adapter into
-the production run path; the current executor still uses its hardcoded `agent.yaml`.
+The execution coordinator materializes every accepted run into its own local workspace
+under `<database-directory>/runs/<RUN_ID>/`. It converts the saved agent definition to
+the pinned Docker Agent v1.158.0 schema-`16` YAML through `gopkg.in/yaml.v3`, then runs
+that exact generated `agent.yaml` in Podman. It never uses a shared project-root YAML.
 
 Capabilities, filesystem/network/shell/secret permissions, model API-key references,
-and arbitrary model parameters are rejected by the adapter for now. They must not be
-silently represented in YAML because their execution-boundary enforcement is part of
-the later run and sandbox work. This is not yet API/runtime enforcement until Task 6.
-Credentials continue to come only from the execution environment, never from generated
-agent YAML.
+and arbitrary model parameters are rejected during run materialization rather than
+silently represented in YAML. Credentials continue to come only from the daemon's
+execution environment, never from HTTP input or generated agent YAML.
+
+Run logs are captured to a bounded local `output.log` in that workspace. The database
+stores only a safe relative output reference; retrieve it through
+`GET /api/runs/{id}/output`, which validates containment before reading. Cancellation
+persists `cancelled`, cancels the active context, and requests removal of a known
+container; late worker results cannot overwrite that terminal state.
 
 ## Configuration
 
@@ -98,7 +108,7 @@ agent YAML.
 | `HORIZON_IMAGE` | `localhost/horizon-sandbox:latest` | Sandbox container image |
 | `HORIZON_REQUEST_TIMEOUT` | `30s` | Podman API request timeout |
 | `HORIZON_CONTAINER_TIMEOUT` | `10m` | Maximum duration of one container execution |
-| `HORIZON_AGENT_TIMEOUT` | `10m` | Configured default agent timeout; not yet enforced by the run executor |
+| `HORIZON_AGENT_TIMEOUT` | `10m` | Maximum duration of one materialized agent run |
 
 At startup, Horizon applies configuration in this order: built-in defaults, optional
 `.env` entries, inherited process environment, then explicitly supplied `--db` and
@@ -144,12 +154,12 @@ horizon/
 ## Capabilities (Phase 1)
 
 - ✅ Agent lifecycle: create, list, get, update, delete via HTTP API
-- ✅ Run execution: manual trigger via API, runs in Podman container
+- ✅ Run execution: saved definitions materialize to isolated per-run Docker Agent YAML workspaces
 - ✅ Persistence: SQLite stores agents, run history, schedules across restarts
 - ✅ Run status: `queued` → `running` → `succeeded`/`failed`/`cancelled`/`timed_out`
 - ✅ Container management: auto-create, start, stream logs, wait, auto-remove
 - ✅ Health checks: Podman socket reachability + image existence
-- ✅ Cancel runs: in-progress runs cancellable via API
+- ✅ Output and cancellation: bounded local output endpoint and active-run cancellation with terminal-state protection
 
 ## Development
 

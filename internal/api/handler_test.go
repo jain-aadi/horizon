@@ -1,7 +1,9 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -10,10 +12,26 @@ import (
 	"time"
 
 	"github.com/jain-aadi/horizon/internal/agent"
+	"github.com/jain-aadi/horizon/internal/run"
+	"github.com/jain-aadi/horizon/internal/sandbox"
 	"github.com/jain-aadi/horizon/internal/storage"
 )
 
 const handlerTestDefaultImage = "localhost/horizon-sandbox:test"
+
+type immediateEngine struct{}
+
+func (immediateEngine) HealthCheck(context.Context) error { return nil }
+
+func (immediateEngine) RunAgent(_ context.Context, opts sandbox.RunOptions) (*sandbox.RunResult, error) {
+	if opts.OnContainerCreated != nil {
+		opts.OnContainerCreated("api-test-container")
+	}
+	_, _ = io.WriteString(opts.OutputWriter, "api test output")
+	return &sandbox.RunResult{ContainerID: "api-test-container", ExitCode: 0}, nil
+}
+
+func (immediateEngine) RemoveContainer(string) error { return nil }
 
 func newTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
@@ -27,8 +45,8 @@ func newTestServer(t *testing.T) *httptest.Server {
 	handler := NewHandler(
 		storage.NewAgentRepository(db),
 		storage.NewRunRepository(db),
-		nil,
-		&Config{DefaultImage: handlerTestDefaultImage},
+		immediateEngine{},
+		&Config{DefaultImage: handlerTestDefaultImage, DataDir: t.TempDir(), DefaultTimeout: time.Second},
 	)
 	mux := http.NewServeMux()
 	handler.RegisterRoutes(mux)
@@ -168,5 +186,84 @@ func TestUpdateAgentPreservesServiceManagedFields(t *testing.T) {
 	}
 	if updated.UpdatedAt.Before(created.UpdatedAt) {
 		t.Errorf("updated UpdatedAt = %s, want after %s", updated.UpdatedAt, created.UpdatedAt)
+	}
+}
+
+func TestCreateRunMaterializesAndServesOutput(t *testing.T) {
+	server := newTestServer(t)
+	defer server.Close()
+
+	createAgentResponse, err := http.Post(
+		server.URL+"/api/agents",
+		"application/json",
+		strings.NewReader(`{"name":"Daily brief","goal":"Prepare a concise daily brief.","instructions":"Summarize the configured input.","model_config":{"provider":"google","model":"gemini-3.5-flash-lite"}}`),
+	)
+	if err != nil {
+		t.Fatalf("POST /api/agents error = %v", err)
+	}
+	defer createAgentResponse.Body.Close()
+	var definition agent.AgentDefinition
+	if err := json.NewDecoder(createAgentResponse.Body).Decode(&definition); err != nil {
+		t.Fatalf("decode created agent: %v", err)
+	}
+
+	createRunResponse, err := http.Post(
+		server.URL+"/api/runs",
+		"application/json",
+		strings.NewReader(`{"agent_id":"`+definition.ID+`","prompt":"Create the daily brief"}`),
+	)
+	if err != nil {
+		t.Fatalf("POST /api/runs error = %v", err)
+	}
+	defer createRunResponse.Body.Close()
+	if createRunResponse.StatusCode != http.StatusAccepted {
+		t.Fatalf("POST /api/runs status = %d, want %d", createRunResponse.StatusCode, http.StatusAccepted)
+	}
+	var created run.RunRecord
+	if err := json.NewDecoder(createRunResponse.Body).Decode(&created); err != nil {
+		t.Fatalf("decode created run: %v", err)
+	}
+	if created.Status != run.RunStatusQueued {
+		t.Errorf("created Status = %q, want %q", created.Status, run.RunStatusQueued)
+	}
+
+	var completed run.RunRecord
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		response, err := http.Get(server.URL + "/api/runs/" + created.ID)
+		if err != nil {
+			t.Fatalf("GET /api/runs/{id} error = %v", err)
+		}
+		if err := json.NewDecoder(response.Body).Decode(&completed); err != nil {
+			response.Body.Close()
+			t.Fatalf("decode run response: %v", err)
+		}
+		response.Body.Close()
+		if run.IsTerminalStatus(completed.Status) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if completed.Status != run.RunStatusSucceeded {
+		t.Fatalf("completed Status = %q, want %q", completed.Status, run.RunStatusSucceeded)
+	}
+	if completed.OutputRef == "" || completed.ContainerID != "api-test-container" {
+		t.Errorf("completed record = %#v, want output ref and container ID", completed)
+	}
+
+	outputResponse, err := http.Get(server.URL + "/api/runs/" + created.ID + "/output")
+	if err != nil {
+		t.Fatalf("GET /api/runs/{id}/output error = %v", err)
+	}
+	defer outputResponse.Body.Close()
+	if outputResponse.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/runs/{id}/output status = %d, want %d", outputResponse.StatusCode, http.StatusOK)
+	}
+	output, err := io.ReadAll(outputResponse.Body)
+	if err != nil {
+		t.Fatalf("read output response: %v", err)
+	}
+	if string(output) != "api test output" {
+		t.Errorf("output = %q, want %q", output, "api test output")
 	}
 }

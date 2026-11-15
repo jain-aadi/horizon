@@ -2,48 +2,81 @@ package api
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/jain-aadi/horizon/internal/agent"
+	"github.com/jain-aadi/horizon/internal/cagent"
 	"github.com/jain-aadi/horizon/internal/run"
-	"github.com/jain-aadi/horizon/internal/sandbox"
 	"github.com/jain-aadi/horizon/internal/storage"
 )
 
 // Handler implements the HTTP API.
 type Handler struct {
 	agentService *agent.Service
-	agentRepo    *storage.AgentRepository
 	runRepo      *storage.RunRepository
-	engine       *sandbox.Engine
+	runService   run.RunCoordinator
+	engine       Engine
 	config       *Config
+}
+
+// Engine is the runtime contract required by the HTTP layer.
+type Engine interface {
+	run.Executor
+	HealthCheck(ctx context.Context) error
 }
 
 // Config holds handler configuration.
 type Config struct {
 	DefaultTimeout time.Duration
 	DefaultImage   string
+	DataDir        string
+	MaxOutputBytes int64
 }
 
 // NewHandler creates a new API handler.
-func NewHandler(agentRepo *storage.AgentRepository, runRepo *storage.RunRepository, engine *sandbox.Engine, cfg *Config) *Handler {
+func NewHandler(agentRepo *storage.AgentRepository, runRepo *storage.RunRepository, engine Engine, cfg *Config) *Handler {
 	defaultImage := ""
 	if cfg != nil {
 		defaultImage = cfg.DefaultImage
 	}
+	agentService := agent.NewService(agentRepo, runRepo, defaultImage)
+	adapter := cagent.NewDefaultAdapter()
+	runConfig := run.Config{LookupAgent: func(ctx context.Context, agentID string) (*run.AgentSnapshot, error) {
+		definition, err := agentService.GetAgent(ctx, agentID)
+		if err != nil {
+			return nil, err
+		}
+		return &run.AgentSnapshot{ID: definition.ID, Version: definition.Version, Definition: definition}, nil
+	}, Materialize: func(snapshot *run.AgentSnapshot) ([]byte, error) {
+		definition, ok := snapshot.Definition.(*agent.AgentDefinition)
+		if !ok {
+			return nil, fmt.Errorf("unexpected agent snapshot definition type %T", snapshot.Definition)
+		}
+		config, err := adapter.BuildConfig(definition)
+		if err != nil {
+			return nil, err
+		}
+		return adapter.MarshalConfig(config)
+	}}
+	if cfg != nil {
+		runConfig.DataDir = cfg.DataDir
+		runConfig.AgentTimeout = cfg.DefaultTimeout
+		runConfig.MaxOutputBytes = cfg.MaxOutputBytes
+	}
+	runConfig.APIKey = os.Getenv("GOOGLE_API_KEY")
 
 	return &Handler{
-		agentService: agent.NewService(agentRepo, runRepo, defaultImage),
-		agentRepo:    agentRepo,
+		agentService: agentService,
 		runRepo:      runRepo,
+		runService:   run.NewService(run.NewStorageRepository(runRepo), engine, runConfig),
 		engine:       engine,
 		config:       cfg,
 	}
@@ -89,7 +122,37 @@ func writeAgentServiceError(w http.ResponseWriter, err error) {
 	http.Error(w, "Internal server error", http.StatusInternalServerError)
 }
 
+func writeRunServiceError(w http.ResponseWriter, err error) {
+	if errors.Is(err, run.ErrAgentNotFound) {
+		http.Error(w, "Agent not found", http.StatusNotFound)
+		return
+	}
+	if errors.Is(err, storage.ErrNotFound) {
+		http.Error(w, "Run not found", http.StatusNotFound)
+		return
+	}
+	if errors.Is(err, run.ErrInvalidAgentID) {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if errors.Is(err, run.ErrRunNotCancellable) {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	if errors.Is(err, run.ErrOutputUnavailable) {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+
+	log.Printf("run service error: %v", err)
+	http.Error(w, "Internal server error", http.StatusInternalServerError)
+}
+
 func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
+	if h.engine == nil {
+		http.Error(w, "Podman engine is not configured", http.StatusServiceUnavailable)
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
@@ -209,6 +272,15 @@ func (h *Handler) handleRunByID(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Run ID required", http.StatusBadRequest)
 		return
 	}
+	if strings.HasSuffix(id, "/output") {
+		id = strings.TrimSuffix(id, "/output")
+		if id == "" || r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		h.getRunOutput(w, r, id)
+		return
+	}
 
 	switch r.Method {
 	case http.MethodGet:
@@ -239,46 +311,18 @@ func (h *Handler) listRuns(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	runs := make([]run.RunRecord, len(rows))
+	runs := make([]*run.RunRecord, len(rows))
 	for i, row := range rows {
-		runs[i] = run.RunRecord{
-			ID:           row.ID,
-			AgentID:      row.AgentID,
-			AgentVersion: row.AgentVersion,
-			TriggerType:  row.TriggerType,
-			Status:       run.RunStatus(row.Status),
-			StartedAt:    row.StartedAt,
-		}
-		if row.CompletedAt.Valid {
-			runs[i].CompletedAt = &row.CompletedAt.Time
-		}
-		if row.ExitCode.Valid {
-			val := int(row.ExitCode.Int64)
-			runs[i].ExitCode = &val
-		}
-		if row.OutputRef.Valid {
-			runs[i].OutputRef = row.OutputRef.String
-		}
-		if row.ErrorMessage.Valid {
-			runs[i].ErrorMessage = row.ErrorMessage.String
-		}
-		if row.ContainerID.Valid {
-			runs[i].ContainerID = row.ContainerID.String
-		}
-		if row.CancelReason.Valid {
-			runs[i].CancelReason = row.CancelReason.String
-		}
+		runs[i] = run.FromStorageRow(row)
 	}
 	json.NewEncoder(w).Encode(runs)
 }
 
 func (h *Handler) createRun(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
 	var req struct {
-		AgentID     string            `json:"agent_id"`
-		TriggerType string            `json:"trigger_type"`
-		Prompt      string            `json:"prompt"`
-		Env         map[string]string `json:"env,omitempty"`
+		AgentID     string `json:"agent_id"`
+		TriggerType string `json:"trigger_type"`
+		Prompt      string `json:"prompt"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
@@ -297,161 +341,55 @@ func (h *Handler) createRun(w http.ResponseWriter, r *http.Request) {
 		req.TriggerType = "manual"
 	}
 
-	// Get agent definition
-	agentRow, err := h.agentRepo.GetByID(ctx, req.AgentID)
+	runRecord, err := h.runService.StartRun(r.Context(), req.AgentID, req.TriggerType, req.Prompt)
 	if err != nil {
-		if err == storage.ErrNotFound {
-			http.Error(w, "Agent not found", http.StatusNotFound)
-			return
-		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeRunServiceError(w, err)
 		return
 	}
-
-	// Create run record
-	runID := uuid.New().String()
-	runRecord := &storage.RunRow{
-		ID:           runID,
-		AgentID:      req.AgentID,
-		AgentVersion: agentRow.Version,
-		TriggerType:  req.TriggerType,
-		Status:       "queued",
-		StartedAt:    time.Now(),
-	}
-
-	if err := h.runRepo.Save(ctx, runRecord); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// Execute agent asynchronously
-	go h.executeRun(context.Background(), runRecord, agentRow, req.Prompt, req.Env)
-
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
-	json.NewEncoder(w).Encode(map[string]string{"run_id": runID, "status": "queued"})
+	json.NewEncoder(w).Encode(runRecord)
 }
 
 func (h *Handler) getRun(w http.ResponseWriter, r *http.Request, id string) {
-	ctx := r.Context()
-	runRow, err := h.runRepo.GetByID(ctx, id)
+	runRecord, err := h.runService.GetRun(r.Context(), id)
 	if err != nil {
-		if err == storage.ErrNotFound {
-			http.Error(w, "Run not found", http.StatusNotFound)
-			return
-		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeRunServiceError(w, err)
 		return
 	}
-	runRec := run.RunRecord{
-		ID:           runRow.ID,
-		AgentID:      runRow.AgentID,
-		AgentVersion: runRow.AgentVersion,
-		TriggerType:  runRow.TriggerType,
-		Status:       run.RunStatus(runRow.Status),
-		StartedAt:    runRow.StartedAt,
-	}
-	if runRow.CompletedAt.Valid {
-		runRec.CompletedAt = &runRow.CompletedAt.Time
-	}
-	if runRow.ExitCode.Valid {
-		val := int(runRow.ExitCode.Int64)
-		runRec.ExitCode = &val
-	}
-	if runRow.OutputRef.Valid {
-		runRec.OutputRef = runRow.OutputRef.String
-	}
-	if runRow.ErrorMessage.Valid {
-		runRec.ErrorMessage = runRow.ErrorMessage.String
-	}
-	if runRow.ContainerID.Valid {
-		runRec.ContainerID = runRow.ContainerID.String
-	}
-	if runRow.CancelReason.Valid {
-		runRec.CancelReason = runRow.CancelReason.String
-	}
-	json.NewEncoder(w).Encode(runRec)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(runRecord)
 }
 
 func (h *Handler) cancelRun(w http.ResponseWriter, r *http.Request, id string) {
-	ctx := r.Context()
-	runRecord, err := h.runRepo.GetByID(ctx, id)
-	if err != nil {
-		if err == storage.ErrNotFound {
-			http.Error(w, "Run not found", http.StatusNotFound)
+	var req struct {
+		Reason string `json:"reason"`
+	}
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+			http.Error(w, "Invalid request body", http.StatusBadRequest)
 			return
 		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+	if err := h.runService.CancelRun(r.Context(), id, req.Reason); err != nil {
+		writeRunServiceError(w, err)
 		return
 	}
-
-	if runRecord.Status == "running" {
-		runRecord.Status = "cancelled"
-		now := time.Now()
-		runRecord.CompletedAt = sql.NullTime{Time: now, Valid: true}
-		runRecord.CancelReason = sql.NullString{String: "User cancelled", Valid: true}
-		h.runRepo.Save(ctx, runRecord)
+	runRecord, err := h.runService.GetRun(r.Context(), id)
+	if err != nil {
+		writeRunServiceError(w, err)
+		return
 	}
-
-	runRec := run.RunRecord{
-		ID:           runRecord.ID,
-		AgentID:      runRecord.AgentID,
-		AgentVersion: runRecord.AgentVersion,
-		TriggerType:  runRecord.TriggerType,
-		Status:       run.RunStatus(runRecord.Status),
-		StartedAt:    runRecord.StartedAt,
-	}
-	if runRecord.CompletedAt.Valid {
-		runRec.CompletedAt = &runRecord.CompletedAt.Time
-	}
-	if runRecord.ExitCode.Valid {
-		val := int(runRecord.ExitCode.Int64)
-		runRec.ExitCode = &val
-	}
-	if runRecord.OutputRef.Valid {
-		runRec.OutputRef = runRecord.OutputRef.String
-	}
-	if runRecord.ErrorMessage.Valid {
-		runRec.ErrorMessage = runRecord.ErrorMessage.String
-	}
-	if runRecord.ContainerID.Valid {
-		runRec.ContainerID = runRecord.ContainerID.String
-	}
-	if runRecord.CancelReason.Valid {
-		runRec.CancelReason = runRecord.CancelReason.String
-	}
-	json.NewEncoder(w).Encode(runRec)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(runRecord)
 }
 
-func (h *Handler) executeRun(ctx context.Context, runRecord *storage.RunRow, agentRow *storage.AgentRow, prompt string, env map[string]string) {
-	// Update status to running
-	runRecord.Status = "running"
-	h.runRepo.Save(ctx, runRecord)
-
-	// Build engine options
-	opts := sandbox.RunOptions{
-		WorkspaceDir: ".",          // TODO: Use proper workspace from agent config
-		YAMLFile:     "agent.yaml", // TODO: Generate from agent definition
-		Prompt:       prompt,
-		OutputWriter: io.Discard, // discard output for now
-		Env:          env,
-		APIKey:       os.Getenv("GOOGLE_API_KEY"),
-	}
-
-	result, err := h.engine.RunAgent(ctx, opts)
+func (h *Handler) getRunOutput(w http.ResponseWriter, r *http.Request, id string) {
+	output, err := h.runService.ReadOutput(r.Context(), id)
 	if err != nil {
-		runRecord.Status = "failed"
-		runRecord.ErrorMessage = sql.NullString{String: err.Error(), Valid: true}
-	} else {
-		runRecord.ContainerID = sql.NullString{String: result.ContainerID, Valid: true}
-		runRecord.ExitCode = sql.NullInt64{Int64: int64(result.ExitCode), Valid: true}
-		if result.ExitCode == 0 {
-			runRecord.Status = "succeeded"
-		} else {
-			runRecord.Status = "failed"
-		}
+		writeRunServiceError(w, err)
+		return
 	}
-
-	now := time.Now()
-	runRecord.CompletedAt = sql.NullTime{Time: now, Valid: true}
-	h.runRepo.Save(ctx, runRecord)
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = w.Write(output)
 }
